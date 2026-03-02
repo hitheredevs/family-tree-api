@@ -1,4 +1,5 @@
 import { queryOne, queryAll, execute } from '../db/connection.js';
+import bcrypt from 'bcryptjs';
 import {
     AppError,
     type PersonRow,
@@ -57,6 +58,39 @@ export async function createPerson(data: {
     );
 
     if (!row) throw new AppError('Failed to create person', 500);
+
+    // Auto-create a non-admin user account for this person
+    try {
+        const baseName = data.firstName.toLowerCase().replace(/[^a-z0-9]/g, '');
+        let username = baseName;
+        let suffix = 1;
+
+        // Disambiguate if username already taken
+        while (true) {
+            const taken = await queryOne(
+                `SELECT id FROM app_user WHERE username = :username`,
+                { username },
+            );
+            if (!taken) break;
+            username = `${baseName}${suffix}`;
+            suffix++;
+        }
+
+        const defaultPassword = `${baseName}@123`;
+        const passwordHash = await bcrypt.hash(defaultPassword, 12);
+
+        await execute(
+            `INSERT INTO app_user (username, password_hash, role, person_id)
+             VALUES (:username, :passwordHash, 'member', :personId)`,
+            { username, passwordHash, personId: row.id },
+        );
+
+        console.log(`👤  Auto-created user "${username}" for person "${data.firstName}" (password: ${defaultPassword})`);
+    } catch (err) {
+        // Non-fatal — person is created even if user creation fails
+        console.warn('⚠️  Auto-create user failed (person still created):', err);
+    }
+
     return toResponse(row);
 }
 
@@ -141,6 +175,12 @@ export async function updatePerson(
 /* ------------------------------------------------------------------ */
 
 export async function softDeletePerson(id: string): Promise<void> {
+    // Delete associated user account first
+    await execute(
+        `DELETE FROM app_user WHERE person_id = :id`,
+        { id },
+    );
+
     await execute(
         `UPDATE person SET is_deleted = true, updated_at = NOW()
      WHERE id = :id`,
