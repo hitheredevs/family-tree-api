@@ -5,6 +5,9 @@ import {
     type PersonResponse,
     type PersonRow,
 } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('person-service');
 
 type SocialLink = { type: string; url: string; handle: string };
 
@@ -113,11 +116,9 @@ export async function createPerson(data: {
             { username, passwordHash, personId: row.id },
         );
 
-        console.log(
-            `👤  Auto-created user "${username}" for person "${data.firstName}" (password: ${defaultPassword})`,
-        );
+        log.info('Auto-created user for person', { username, personId: row.id, firstName: data.firstName });
     } catch (err) {
-        console.warn('⚠️  Auto-create user failed (person still created):', err);
+        log.warn('Auto-create user failed (person still created)', { error: err instanceof Error ? err.message : String(err) });
     }
 
     return toResponse(row);

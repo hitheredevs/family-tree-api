@@ -9,6 +9,9 @@ import {
     type UserResponse,
     type UserRow,
 } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('auth-service');
 
 const JWT_SECRET = process.env.JWT_SECRET ?? 'fallback-secret';
 const TOKEN_EXPIRY = '7d';
@@ -36,6 +39,7 @@ async function getUserWithPersonByUserId(userId: string): Promise<UserRow> {
     );
 
     if (!row) {
+        log.warn('User not found by userId', { userId });
         throw new AppError('User not found', 404, 'ERR_NOT_FOUND');
     }
 
@@ -52,6 +56,7 @@ async function getUserWithPersonByUsername(username: string): Promise<UserRow> {
     );
 
     if (!row) {
+        log.warn('User not found by username', { username });
         throw new AppError('Invalid username or password', 401, 'ERR_AUTH');
     }
 
@@ -66,12 +71,56 @@ async function createOtpRequest(
     userId: string,
     phoneNumber: string,
     purpose: OtpPurpose,
-): Promise<void> {
+): Promise<string> {
+    const otpCode = generateOtp();
     await execute(
         `INSERT INTO otp_request (user_id, phone_number, purpose, otp_code, expires_at)
          VALUES (:userId, :phoneNumber, :purpose, :otpCode, NOW() + INTERVAL '${OTP_EXPIRY_MINUTES} minutes')`,
-        { userId, phoneNumber, purpose, otpCode: generateOtp() },
+        { userId, phoneNumber, purpose, otpCode },
     );
+    return otpCode;
+}
+
+/**
+ * Send an SMS OTP using Fast2SMS (India-native, no DLT registration required
+ * for the OTP route). Set FAST2SMS_API_KEY in the API .env file.
+ *
+ * phoneNumber is expected in E.164 format: +919876543210
+ * Fast2SMS needs the raw 10-digit number: 9876543210
+ */
+async function sendSmsOtp(
+    phoneNumber: string,
+    otp: string,
+): Promise<void> {
+    const apiKey = process.env.FAST2SMS_API_KEY;
+    if (!apiKey) {
+        // In development without a key, just log and continue so the rest of
+        // the flow works; the OTP is still stored in the DB.
+        log.warn('FAST2SMS_API_KEY not set — OTP not sent via SMS', { otp });
+        return;
+    }
+
+    // Strip country code to get the 10-digit number Fast2SMS expects
+    const digits = phoneNumber.replace(/^\+91/, '').replace(/\D/g, '');
+
+    const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+        method: 'POST',
+        headers: {
+            authorization: apiKey,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            route: 'otp',
+            variables_values: otp,
+            numbers: digits,
+        }),
+    });
+
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        log.error('Fast2SMS error', { status: res.status, body });
+        // Don't throw — the OTP is in the DB; user can retry
+    }
 }
 
 async function getLatestOtpRequest(
@@ -101,10 +150,12 @@ export async function login(
     username: string,
     password: string,
 ): Promise<{ token: string; user: UserResponse }> {
+    log.info('Login service called', { username });
     const row = await getUserWithPersonByUsername(username);
 
     const valid = await bcrypt.compare(password, row.password_hash);
     if (!valid) {
+        log.warn('Invalid password for user', { username, userId: row.id });
         throw new AppError('Invalid username or password', 401, 'ERR_AUTH');
     }
 
@@ -115,6 +166,7 @@ export async function login(
     };
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+    log.info('JWT issued', { userId: row.id, role: row.role });
 
     return {
         token,
@@ -123,6 +175,7 @@ export async function login(
 }
 
 export async function getCurrentUser(userId: string): Promise<UserResponse> {
+    log.info('getCurrentUser called', { userId });
     return toUserResponse(await getUserWithPersonByUserId(userId));
 }
 
@@ -234,7 +287,8 @@ export async function requestPasswordResetOtp(
         throw new AppError('Username and phone number do not match', 400, 'ERR_VALIDATION');
     }
 
-    await createOtpRequest(user.id, phoneNumber, 'reset-password');
+    const otp = await createOtpRequest(user.id, phoneNumber, 'reset-password');
+    await sendSmsOtp(phoneNumber, otp);
     return { message: 'OTP sent successfully' };
 }
 
@@ -276,6 +330,44 @@ export async function resetPasswordWithOtp(
          WHERE id = :id`,
         { id: request.id },
     );
+
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await execute(
+        `UPDATE app_user
+         SET password_hash = :newHash,
+             must_change_password = false,
+             updated_at = NOW()
+         WHERE id = :userId`,
+        { newHash, userId: user.id },
+    );
+}
+
+/**
+ * Reset password after the caller has verified identity via WhatsApp (OTpless).
+ * The whatsappPhone is the E.164 number returned by OTpless — it is already
+ * verified to be owned by the person holding that WhatsApp account.
+ */
+export async function resetPasswordWithWhatsApp(
+    username: string,
+    whatsappPhone: string,
+    newPassword: string,
+): Promise<void> {
+    if (!username?.trim() || !whatsappPhone?.trim()) {
+        throw new AppError('Username and phone number are required', 400, 'ERR_VALIDATION');
+    }
+
+    if (newPassword.length < 6) {
+        throw new AppError('New password must be at least 6 characters', 400, 'ERR_VALIDATION');
+    }
+
+    const user = await getUserWithPersonByUsername(username);
+    if (user.phone_number !== whatsappPhone) {
+        throw new AppError(
+            'The WhatsApp number does not match the records for this username',
+            400,
+            'ERR_VALIDATION',
+        );
+    }
 
     const newHash = await bcrypt.hash(newPassword, 12);
     await execute(

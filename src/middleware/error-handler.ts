@@ -1,5 +1,8 @@
 import type { Request, Response, NextFunction } from 'express';
 import { AppError } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('error-handler');
 
 /**
  * Global Express error handler.
@@ -12,6 +15,13 @@ export function errorHandler(
     _next: NextFunction,
 ): void {
     if (err instanceof AppError) {
+        log.warn('AppError', {
+            statusCode: err.statusCode,
+            code: err.code,
+            message: err.message,
+            path: _req.path,
+            method: _req.method,
+        });
         res.status(err.statusCode).json({
             error: err.message,
             code: err.code,
@@ -19,7 +29,12 @@ export function errorHandler(
         return;
     }
 
-    console.error('Unhandled error:', err);
+    log.error('Unhandled error', {
+        message: err.message,
+        stack: err.stack,
+        path: _req.path,
+        method: _req.method,
+    });
     res.status(500).json({
         error: 'Internal server error',
         code: 'ERR_INTERNAL',

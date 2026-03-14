@@ -25,6 +25,9 @@ router.post('/forgot-password/request', authController.requestForgotPasswordOtp)
 // POST /api/auth/forgot-password/reset
 router.post('/forgot-password/reset', authController.resetPasswordWithOtp);
 
+// POST /api/auth/forgot-password/whatsapp-reset  (WhatsApp-verified identity)
+router.post('/forgot-password/whatsapp-reset', authController.resetPasswordWithWhatsApp);
+
 // GET /api/auth/me  (requires token)
 router.get('/me', authMiddleware, authController.getMe);
 

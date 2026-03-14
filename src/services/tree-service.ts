@@ -5,6 +5,9 @@ import {
     type RelationshipRow,
     type TreePerson,
 } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('tree-service');
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -73,7 +76,11 @@ export async function getSubtree(
         `SELECT * FROM person WHERE id = :id AND is_deleted = false`,
         { id: centerId },
     );
-    if (!center) throw new AppError('Person not found', 404, 'ERR_NOT_FOUND');
+    if (!center) {
+        log.warn('Subtree center person not found', { centerId });
+        throw new AppError('Person not found', 404, 'ERR_NOT_FOUND');
+    }
+    log.info('Building subtree', { centerId });
 
     // 2. Recursive CTE: walk ALL relationship edges to find every connected person
     //    Since relationships are stored bidirectionally, following source→target

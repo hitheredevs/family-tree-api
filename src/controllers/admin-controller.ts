@@ -1,6 +1,9 @@
 import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from '../types/index.js';
 import * as adminService from '../services/admin-service.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('admin-controller');
 
 /* ------------------------------------------------------------------ */
 /*  Create user for a person                                           */
@@ -21,6 +24,7 @@ export async function createUser(
             return;
         }
 
+        log.info('Creating user', { username, role: role ?? 'member', personId });
         const user = await adminService.createUser({
             username,
             password,
@@ -28,8 +32,10 @@ export async function createUser(
             personId,
         });
 
+        log.info('User created', { userId: user.id, username });
         res.status(201).json(user);
     } catch (err) {
+        log.error('Create user failed', { username: req.body?.username, error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }
@@ -44,9 +50,12 @@ export async function listUsers(
     next: NextFunction,
 ): Promise<void> {
     try {
+        log.info('Listing users');
         const users = await adminService.listUsers();
+        log.info('Users listed', { count: users.length });
         res.json(users);
     } catch (err) {
+        log.error('List users failed', { error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }

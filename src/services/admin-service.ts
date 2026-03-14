@@ -1,6 +1,9 @@
 import bcrypt from 'bcryptjs';
 import { queryOne, queryAll, execute } from '../db/connection.js';
 import { AppError, type UserRow, type UserResponse } from '../types/index.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('admin-service');
 
 /* ------------------------------------------------------------------ */
 /*  Create a user account for an existing person                       */
@@ -59,6 +62,7 @@ export async function createUser(data: {
 
     if (!row) throw new AppError('Failed to create user', 500);
 
+    log.info('User created in admin-service', { userId: row.id, username: row.username, role: row.role });
     return {
         id: row.id,
         username: row.username,

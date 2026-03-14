@@ -6,6 +6,9 @@ import {
     assertNoDuplicate,
     assertMaxSpouses,
 } from '../validators/graph-validator.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('relationship-service');
 
 /* ------------------------------------------------------------------ */
 /*  Inverse map                                                        */
@@ -118,6 +121,7 @@ export async function addRelationship(data: {
         return { forward, inverse };
     } catch (err) {
         await t.rollback();
+        log.error('Add relationship transaction failed', { sourcePersonId, targetPersonId, relationshipType, error: err instanceof Error ? err.message : String(err) });
         throw err;
     }
 }

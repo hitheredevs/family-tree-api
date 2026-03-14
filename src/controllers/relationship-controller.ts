@@ -1,6 +1,9 @@
 import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest, RelationshipType } from '../types/index.js';
 import * as relationshipService from '../services/relationship-service.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('relationship-controller');
 
 const VALID_TYPES = new Set<string>(['PARENT', 'CHILD', 'SPOUSE']);
 
@@ -30,6 +33,7 @@ export async function add(
             return;
         }
 
+        log.info('Adding relationship', { sourcePersonId, targetPersonId, relationshipType, userId: req.user!.userId });
         const result = await relationshipService.addRelationship({
             sourcePersonId,
             targetPersonId,
@@ -37,8 +41,10 @@ export async function add(
             createdBy: req.user!.userId,
         });
 
+        log.info('Relationship added', { forwardId: result.forward.id, inverseId: result.inverse.id });
         res.status(201).json(result);
     } catch (err) {
+        log.error('Add relationship failed', { error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }
@@ -53,9 +59,13 @@ export async function remove(
     next: NextFunction,
 ): Promise<void> {
     try {
-        await relationshipService.removeRelationship(req.params.id as string);
+        const id = req.params.id as string;
+        log.info('Removing relationship', { relationshipId: id });
+        await relationshipService.removeRelationship(id);
+        log.info('Relationship removed', { relationshipId: id });
         res.json({ message: 'Relationship removed' });
     } catch (err) {
+        log.error('Remove relationship failed', { relationshipId: req.params.id, error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }
@@ -70,11 +80,13 @@ export async function getForPerson(
     next: NextFunction,
 ): Promise<void> {
     try {
-        const relationships = await relationshipService.getRelationshipsForPerson(
-            req.params.personId as string,
-        );
+        const personId = req.params.personId as string;
+        log.info('Fetching relationships', { personId });
+        const relationships = await relationshipService.getRelationshipsForPerson(personId);
+        log.info('Relationships fetched', { personId, count: relationships.length });
         res.json(relationships);
     } catch (err) {
+        log.error('Fetch relationships failed', { personId: req.params.personId, error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }
@@ -106,14 +118,17 @@ export async function updateStatus(
             return;
         }
 
+        log.info('Updating relationship status', { sourcePersonId, targetPersonId, status });
         await relationshipService.updateRelationshipStatus(
             sourcePersonId,
             targetPersonId,
             status,
         );
 
+        log.info('Relationship status updated', { sourcePersonId, targetPersonId, status });
         res.json({ message: 'Relationship status updated' });
     } catch (err) {
+        log.error('Update relationship status failed', { error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }
