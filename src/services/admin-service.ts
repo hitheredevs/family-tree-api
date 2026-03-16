@@ -14,7 +14,10 @@ import {
 } from '../utils/password-link.js';
 
 const log = createLogger('admin-service');
-const PASSWORD_LINK_EXPIRY_MINUTES = 10;
+const PASSWORD_LINK_EXPIRY_MS: Record<PasswordLinkPurpose, number> = {
+    'setup-password': 24 * 60 * 60 * 1000,
+    'reset-password': 60 * 60 * 1000,
+};
 
 /* ------------------------------------------------------------------ */
 /*  Create a user account for an existing person                       */
@@ -234,7 +237,9 @@ export async function generatePasswordLink(data: {
 
     const rawToken = generatePasswordLinkToken();
     const tokenHash = hashPasswordLinkToken(rawToken);
-    const expiresAt = new Date(Date.now() + PASSWORD_LINK_EXPIRY_MINUTES * 60 * 1000).toISOString();
+    const expiresAt = new Date(
+        Date.now() + PASSWORD_LINK_EXPIRY_MS[data.purpose],
+    ).toISOString();
 
     await execute(
         `INSERT INTO password_link_token (user_id, purpose, token_hash, expires_at, created_by)
