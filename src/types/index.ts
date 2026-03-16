@@ -55,16 +55,16 @@ export interface UserRow {
     updated_at: string;
 }
 
-export type OtpPurpose = 'verify-phone' | 'reset-password';
+export type PasswordLinkPurpose = 'setup-password' | 'reset-password';
 
-export interface OtpRequestRow {
+export interface PasswordLinkTokenRow {
     id: string;
     user_id: string;
-    phone_number: string;
-    purpose: OtpPurpose;
-    otp_code: string;
+    purpose: PasswordLinkPurpose;
+    token_hash: string;
     expires_at: string;
-    verified_at: string | null;
+    used_at: string | null;
+    created_by: string | null;
     created_at: string;
     updated_at: string;
 }

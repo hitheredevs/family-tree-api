@@ -98,118 +98,48 @@ export async function changePassword(
     }
 }
 
-export async function requestPhoneOtp(
-    req: AuthenticatedRequest,
+export async function getPasswordLinkDetails(
+    req: Request,
     res: Response,
     next: NextFunction,
 ): Promise<void> {
     try {
-        if (!req.user) {
-            res.status(401).json({ error: 'Not authenticated' });
+        const token = String(req.query.token ?? '');
+        if (!token) {
+            res.status(400).json({ error: 'Password link token is required' });
             return;
         }
 
-        const { phoneNumber } = req.body;
-        log.info('Phone OTP requested', { userId: req.user.userId, phoneNumber });
-        const result = await authService.requestPhoneVerificationOtp(
-            req.user.userId,
-            phoneNumber,
-        );
-        log.info('Phone OTP sent', { userId: req.user.userId });
+        const result = await authService.getPasswordLinkDetails(token);
         res.json(result);
     } catch (err) {
-        log.error('Phone OTP request failed', {
-            userId: req.user?.userId,
+        log.error('Get password link details failed', {
             error: err instanceof Error ? err.message : String(err),
         });
         next(err);
     }
 }
 
-export async function verifyPhoneOtp(
-    req: AuthenticatedRequest,
-    res: Response,
-    next: NextFunction,
-): Promise<void> {
-    try {
-        if (!req.user) {
-            res.status(401).json({ error: 'Not authenticated' });
-            return;
-        }
-
-        const { otp } = req.body;
-        log.info('Phone OTP verification attempt', { userId: req.user.userId });
-        const user = await authService.verifyPhoneOtp(req.user.userId, otp);
-        log.info('Phone verified successfully', { userId: req.user.userId });
-        res.json({ message: 'Phone verified successfully', user });
-    } catch (err) {
-        log.error('Phone OTP verification failed', {
-            userId: req.user?.userId,
-            error: err instanceof Error ? err.message : String(err),
-        });
-        next(err);
-    }
-}
-
-export async function requestForgotPasswordOtp(
+export async function consumePasswordLink(
     req: Request,
     res: Response,
     next: NextFunction,
 ): Promise<void> {
     try {
-        const { username, phoneNumber } = req.body;
-        log.info('Forgot password OTP requested', { username });
-        const result = await authService.requestPasswordResetOtp(username, phoneNumber);
-        log.info('Forgot password OTP sent', { username });
+        const { token, newPassword, phoneNumber } = req.body as {
+            token?: string;
+            newPassword?: string;
+            phoneNumber?: string;
+        };
+
+        const result = await authService.consumePasswordLink(
+            token ?? '',
+            newPassword ?? '',
+            phoneNumber ?? '',
+        );
         res.json(result);
     } catch (err) {
-        log.error('Forgot password OTP failed', {
-            username: req.body?.username,
-            error: err instanceof Error ? err.message : String(err),
-        });
-        next(err);
-    }
-}
-
-export async function resetPasswordWithOtp(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-): Promise<void> {
-    try {
-        const { username, phoneNumber, otp, newPassword } = req.body;
-        log.info('Password reset with OTP attempt', { username });
-        await authService.resetPasswordWithOtp(
-            username,
-            phoneNumber,
-            otp,
-            newPassword,
-        );
-        log.info('Password reset with OTP successful', { username });
-        res.json({ message: 'Password reset successfully' });
-    } catch (err) {
-        log.error('Password reset with OTP failed', {
-            username: req.body?.username,
-            error: err instanceof Error ? err.message : String(err),
-        });
-        next(err);
-    }
-}
-
-export async function resetPasswordWithWhatsApp(
-    req: Request,
-    res: Response,
-    next: NextFunction,
-): Promise<void> {
-    try {
-        const { username, whatsappPhone, newPassword } = req.body;
-        log.info('Password reset with WhatsApp attempt', { username });
-        await authService.resetPasswordWithWhatsApp(username, whatsappPhone, newPassword);
-        log.info('Password reset with WhatsApp successful', { username });
-        res.json({ message: 'Password reset successfully' });
-    } catch (err) {
-        log.error('Password reset with WhatsApp failed', {
-            username: req.body?.username,
+        log.error('Consume password link failed', {
             error: err instanceof Error ? err.message : String(err),
         });
         next(err);

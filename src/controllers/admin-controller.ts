@@ -59,3 +59,44 @@ export async function listUsers(
         next(err);
     }
 }
+
+export async function generatePasswordLink(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction,
+): Promise<void> {
+    try {
+        if (!req.user) {
+            res.status(401).json({ error: 'Not authenticated' });
+            return;
+        }
+
+        const personId = req.params.personId as string;
+        const { purpose } = req.body as { purpose?: 'setup-password' | 'reset-password' };
+
+        if (!purpose || (purpose !== 'setup-password' && purpose !== 'reset-password')) {
+            res.status(400).json({ error: 'purpose must be setup-password or reset-password' });
+            return;
+        }
+
+        log.info('Generating password link', {
+            personId,
+            purpose,
+            adminUserId: req.user.userId,
+        });
+
+        const result = await adminService.generatePasswordLink({
+            personId,
+            purpose,
+            createdByUserId: req.user.userId,
+        });
+
+        res.json(result);
+    } catch (err) {
+        log.error('Generate password link failed', {
+            personId: req.params.personId,
+            error: err instanceof Error ? err.message : String(err),
+        });
+        next(err);
+    }
+}

@@ -13,4 +13,7 @@ router.post('/users', adminController.createUser);
 // GET  /api/admin/users        — list all users
 router.get('/users', adminController.listUsers);
 
+// POST /api/admin/persons/:personId/password-link  — generate setup/reset link
+router.post('/persons/:personId/password-link', adminController.generatePasswordLink);
+
 export default router;

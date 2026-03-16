@@ -13,20 +13,11 @@ router.post('/logout', authController.logout);
 // PUT /api/auth/change-password (requires token)
 router.put('/change-password', authMiddleware, authController.changePassword);
 
-// POST /api/auth/phone-otp/request (requires token)
-router.post('/phone-otp/request', authMiddleware, authController.requestPhoneOtp);
+// GET /api/auth/password-link?token=...  — validate public password link
+router.get('/password-link', authController.getPasswordLinkDetails);
 
-// POST /api/auth/phone-otp/verify (requires token)
-router.post('/phone-otp/verify', authMiddleware, authController.verifyPhoneOtp);
-
-// POST /api/auth/forgot-password/request
-router.post('/forgot-password/request', authController.requestForgotPasswordOtp);
-
-// POST /api/auth/forgot-password/reset
-router.post('/forgot-password/reset', authController.resetPasswordWithOtp);
-
-// POST /api/auth/forgot-password/whatsapp-reset  (WhatsApp-verified identity)
-router.post('/forgot-password/whatsapp-reset', authController.resetPasswordWithWhatsApp);
+// POST /api/auth/password-link/consume   — consume public password link
+router.post('/password-link/consume', authController.consumePasswordLink);
 
 // GET /api/auth/me  (requires token)
 router.get('/me', authMiddleware, authController.getMe);

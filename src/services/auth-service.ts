@@ -1,21 +1,31 @@
 import bcrypt from 'bcryptjs';
+import { getDb, execute, queryOne } from '../db/connection.js';
 import jwt from 'jsonwebtoken';
-import { execute, queryOne } from '../db/connection.js';
 import {
     AppError,
     type AuthPayload,
-    type OtpPurpose,
-    type OtpRequestRow,
+    type PasswordLinkPurpose,
+    type PasswordLinkTokenRow,
     type UserResponse,
     type UserRow,
 } from '../types/index.js';
 import { createLogger } from '../utils/logger.js';
+import { hashPasswordLinkToken } from '../utils/password-link.js';
 
 const log = createLogger('auth-service');
 
 const JWT_SECRET = process.env.JWT_SECRET ?? 'fallback-secret';
 const TOKEN_EXPIRY = '7d';
-const OTP_EXPIRY_MINUTES = 10;
+
+function normalizePhoneNumber(phoneNumber: string): string {
+    const normalized = phoneNumber.trim().replace(/[\s()-]/g, '');
+
+    if (!normalized) {
+        throw new AppError('Phone number is required', 400, 'ERR_VALIDATION');
+    }
+
+    return normalized;
+}
 
 function toUserResponse(row: UserRow): UserResponse {
     return {
@@ -63,87 +73,60 @@ async function getUserWithPersonByUsername(username: string): Promise<UserRow> {
     return row;
 }
 
-function generateOtp(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-}
+type PasswordLinkLookupRow = PasswordLinkTokenRow & {
+    username: string;
+    person_id: string;
+    phone_number: string | null;
+};
 
-async function createOtpRequest(
-    userId: string,
-    phoneNumber: string,
-    purpose: OtpPurpose,
-): Promise<string> {
-    const otpCode = generateOtp();
-    await execute(
-        `INSERT INTO otp_request (user_id, phone_number, purpose, otp_code, expires_at)
-         VALUES (:userId, :phoneNumber, :purpose, :otpCode, NOW() + INTERVAL '${OTP_EXPIRY_MINUTES} minutes')`,
-        { userId, phoneNumber, purpose, otpCode },
-    );
-    return otpCode;
-}
-
-/**
- * Send an SMS OTP using Fast2SMS (India-native, no DLT registration required
- * for the OTP route). Set FAST2SMS_API_KEY in the API .env file.
- *
- * phoneNumber is expected in E.164 format: +919876543210
- * Fast2SMS needs the raw 10-digit number: 9876543210
- */
-async function sendSmsOtp(
-    phoneNumber: string,
-    otp: string,
-): Promise<void> {
-    const apiKey = process.env.FAST2SMS_API_KEY;
-    if (!apiKey) {
-        // In development without a key, just log and continue so the rest of
-        // the flow works; the OTP is still stored in the DB.
-        log.warn('FAST2SMS_API_KEY not set — OTP not sent via SMS', { otp });
-        return;
+async function getPasswordLinkByToken(token: string): Promise<PasswordLinkLookupRow> {
+    if (!token?.trim()) {
+        throw new AppError('Password link token is required', 400, 'ERR_VALIDATION');
     }
 
-    // Strip country code to get the 10-digit number Fast2SMS expects
-    const digits = phoneNumber.replace(/^\+91/, '').replace(/\D/g, '');
-
-    const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
-        method: 'POST',
-        headers: {
-            authorization: apiKey,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            route: 'otp',
-            variables_values: otp,
-            numbers: digits,
-        }),
-    });
-
-    if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        log.error('Fast2SMS error', { status: res.status, body });
-        // Don't throw — the OTP is in the DB; user can retry
-    }
-}
-
-async function getLatestOtpRequest(
-    userId: string,
-    purpose: OtpPurpose,
-): Promise<OtpRequestRow> {
-    const row = await queryOne<OtpRequestRow>(
-        `SELECT *
-         FROM otp_request
-         WHERE user_id = :userId
-           AND purpose = :purpose
-           AND verified_at IS NULL
-           AND expires_at > NOW()
-         ORDER BY created_at DESC
-         LIMIT 1`,
-        { userId, purpose },
+    const tokenHash = hashPasswordLinkToken(token.trim());
+    const row = await queryOne<PasswordLinkLookupRow>(
+        `SELECT plt.*, u.username, u.person_id, p.phone_number
+         FROM password_link_token plt
+         INNER JOIN app_user u ON u.id = plt.user_id
+                 INNER JOIN person p ON p.id = u.person_id
+         WHERE plt.token_hash = :tokenHash
+           AND plt.used_at IS NULL
+           AND plt.expires_at > NOW()`,
+        { tokenHash },
     );
 
     if (!row) {
-        throw new AppError('Please request a new OTP first', 400, 'ERR_OTP_REQUIRED');
+        throw new AppError('This password link is invalid or expired', 400, 'ERR_LINK_INVALID');
     }
 
     return row;
+}
+
+async function assertPhoneNumberAvailable(
+    phoneNumber: string,
+    currentPersonId?: string,
+): Promise<void> {
+    const existing = await queryOne<{ id: string }>(
+        `SELECT id
+         FROM person
+         WHERE phone_number = :phoneNumber
+           AND is_deleted = false
+           AND (:currentPersonId::uuid IS NULL OR id != :currentPersonId::uuid)
+         LIMIT 1`,
+        {
+            phoneNumber,
+            currentPersonId: currentPersonId ?? null,
+        },
+    );
+
+    if (existing) {
+        throw new AppError(
+            'This phone number is already being used by another person',
+            409,
+            'ERR_DUPLICATE_PHONE',
+        );
+    }
 }
 
 export async function login(
@@ -191,14 +174,6 @@ export async function changePassword(
         throw new AppError('Current password is incorrect', 400, 'ERR_BAD_PASSWORD');
     }
 
-    if (row.must_change_password && !row.phone_verified) {
-        throw new AppError(
-            'Verify your phone number with OTP before changing the default password',
-            400,
-            'ERR_PHONE_NOT_VERIFIED',
-        );
-    }
-
     if (newPassword.length < 6) {
         throw new AppError(
             'New password must be at least 6 characters',
@@ -219,163 +194,113 @@ export async function changePassword(
     );
 }
 
-export async function requestPhoneVerificationOtp(
-    userId: string,
-    phoneNumber: string,
-): Promise<{ message: string; phoneNumber: string }> {
-    if (!phoneNumber?.trim()) {
-        throw new AppError('Phone number is required', 400, 'ERR_VALIDATION');
-    }
-
-    const user = await getUserWithPersonByUserId(userId);
-
-    await execute(
-        `UPDATE person
-         SET phone_number = :phoneNumber,
-             phone_verified = false,
-             phone_verified_at = NULL,
-             updated_at = NOW()
-         WHERE id = :personId`,
-        { phoneNumber, personId: user.person_id },
-    );
-
-    await createOtpRequest(user.id, phoneNumber, 'verify-phone');
-
-    return { message: 'OTP sent successfully', phoneNumber };
+export async function getPasswordLinkDetails(token: string): Promise<{
+    username: string;
+    purpose: PasswordLinkPurpose;
+    expiresAt: string;
+}> {
+    const row = await getPasswordLinkByToken(token);
+    return {
+        username: row.username,
+        purpose: row.purpose,
+        expiresAt: row.expires_at,
+    };
 }
 
-export async function verifyPhoneOtp(
-    userId: string,
-    otp: string,
-): Promise<UserResponse> {
-    if (!otp?.trim()) {
-        throw new AppError('OTP is required', 400, 'ERR_VALIDATION');
-    }
-
-    const request = await getLatestOtpRequest(userId, 'verify-phone');
-
-    await execute(
-        `UPDATE otp_request
-         SET verified_at = NOW(), updated_at = NOW()
-         WHERE id = :id`,
-        { id: request.id },
-    );
-
-    const user = await getUserWithPersonByUserId(userId);
-    await execute(
-        `UPDATE person
-         SET phone_verified = true,
-             phone_verified_at = NOW(),
-             updated_at = NOW()
-         WHERE id = :personId`,
-        { personId: user.person_id },
-    );
-
-    return toUserResponse(await getUserWithPersonByUserId(userId));
-}
-
-export async function requestPasswordResetOtp(
-    username: string,
+export async function consumePasswordLink(
+    token: string,
+    newPassword: string,
     phoneNumber: string,
 ): Promise<{ message: string }> {
-    if (!username?.trim() || !phoneNumber?.trim()) {
-        throw new AppError('Username and phone number are required', 400, 'ERR_VALIDATION');
-    }
-
-    const user = await getUserWithPersonByUsername(username);
-    if (user.phone_number !== phoneNumber) {
-        throw new AppError('Username and phone number do not match', 400, 'ERR_VALIDATION');
-    }
-
-    const otp = await createOtpRequest(user.id, phoneNumber, 'reset-password');
-    await sendSmsOtp(phoneNumber, otp);
-    return { message: 'OTP sent successfully' };
-}
-
-export async function resetPasswordWithOtp(
-    username: string,
-    phoneNumber: string,
-    otp: string,
-    newPassword: string,
-): Promise<void> {
-    if (!username?.trim() || !phoneNumber?.trim() || !otp?.trim()) {
-        throw new AppError(
-            'Username, phone number and OTP are required',
-            400,
-            'ERR_VALIDATION',
-        );
-    }
-
-    if (newPassword.length < 6) {
-        throw new AppError(
-            'New password must be at least 6 characters',
-            400,
-            'ERR_VALIDATION',
-        );
-    }
-
-    const user = await getUserWithPersonByUsername(username);
-    if (user.phone_number !== phoneNumber) {
-        throw new AppError('Username and phone number do not match', 400, 'ERR_VALIDATION');
-    }
-
-    const request = await getLatestOtpRequest(user.id, 'reset-password');
-    if (request.phone_number !== phoneNumber) {
-        throw new AppError('OTP request does not match the phone number', 400, 'ERR_VALIDATION');
-    }
-
-    await execute(
-        `UPDATE otp_request
-         SET verified_at = NOW(), updated_at = NOW()
-         WHERE id = :id`,
-        { id: request.id },
-    );
-
-    const newHash = await bcrypt.hash(newPassword, 12);
-    await execute(
-        `UPDATE app_user
-         SET password_hash = :newHash,
-             must_change_password = false,
-             updated_at = NOW()
-         WHERE id = :userId`,
-        { newHash, userId: user.id },
-    );
-}
-
-/**
- * Reset password after the caller has verified identity via WhatsApp (OTpless).
- * The whatsappPhone is the E.164 number returned by OTpless — it is already
- * verified to be owned by the person holding that WhatsApp account.
- */
-export async function resetPasswordWithWhatsApp(
-    username: string,
-    whatsappPhone: string,
-    newPassword: string,
-): Promise<void> {
-    if (!username?.trim() || !whatsappPhone?.trim()) {
-        throw new AppError('Username and phone number are required', 400, 'ERR_VALIDATION');
-    }
-
-    if (newPassword.length < 6) {
+    if (!newPassword?.trim() || newPassword.length < 6) {
         throw new AppError('New password must be at least 6 characters', 400, 'ERR_VALIDATION');
     }
 
-    const user = await getUserWithPersonByUsername(username);
-    if (user.phone_number !== whatsappPhone) {
-        throw new AppError(
-            'The WhatsApp number does not match the records for this username',
-            400,
-            'ERR_VALIDATION',
-        );
+    const link = await getPasswordLinkByToken(token);
+    const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
+
+    if (link.purpose === 'reset-password') {
+        if (!link.phone_number) {
+            throw new AppError(
+                'No phone number is saved on this profile. Ask an admin to generate a setup link instead.',
+                400,
+                'ERR_PHONE_REQUIRED',
+            );
+        }
+
+        if (normalizePhoneNumber(link.phone_number) !== normalizedPhoneNumber) {
+            throw new AppError(
+                'The phone number does not match this user profile',
+                400,
+                'ERR_PHONE_MISMATCH',
+            );
+        }
+    } else {
+        await assertPhoneNumberAvailable(normalizedPhoneNumber, link.person_id);
     }
 
     const newHash = await bcrypt.hash(newPassword, 12);
-    await execute(
-        `UPDATE app_user
-         SET password_hash = :newHash,
-             must_change_password = false,
-             updated_at = NOW()
-         WHERE id = :userId`,
-        { newHash, userId: user.id },
-    );
+    const db = await getDb();
+    const transaction = await db.transaction();
+
+    try {
+        await db.query(
+            `UPDATE person
+             SET phone_number = :phoneNumber,
+                 phone_verified = false,
+                 updated_at = NOW()
+             WHERE id = :personId`,
+            {
+                replacements: {
+                    phoneNumber: normalizedPhoneNumber,
+                    personId: link.person_id,
+                },
+                transaction,
+            },
+        );
+
+        await db.query(
+            `UPDATE app_user
+             SET password_hash = :newHash,
+                 must_change_password = false,
+                 updated_at = NOW()
+             WHERE id = :userId`,
+            {
+                replacements: { newHash, userId: link.user_id },
+                transaction,
+            },
+        );
+
+        await db.query(
+            `UPDATE password_link_token
+             SET used_at = NOW(), updated_at = NOW()
+             WHERE id = :id`,
+            {
+                replacements: { id: link.id },
+                transaction,
+            },
+        );
+
+        await db.query(
+            `DELETE FROM password_link_token
+             WHERE user_id = :userId
+               AND id != :id
+               AND used_at IS NULL`,
+            {
+                replacements: { userId: link.user_id, id: link.id },
+                transaction,
+            },
+        );
+
+        await transaction.commit();
+        log.info('Password link consumed', {
+            userId: link.user_id,
+            username: link.username,
+            purpose: link.purpose,
+        });
+        return { message: 'Password updated successfully' };
+    } catch (err) {
+        await transaction.rollback();
+        throw err;
+    }
 }

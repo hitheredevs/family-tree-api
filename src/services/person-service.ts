@@ -11,6 +11,43 @@ const log = createLogger('person-service');
 
 type SocialLink = { type: string; url: string; handle: string };
 
+function normalizePhoneNumber(phoneNumber: string): string {
+    return phoneNumber.trim().replace(/[\s()-]/g, '');
+}
+
+async function assertPhoneNumberAvailable(
+    phoneNumber: string | null | undefined,
+    currentPersonId?: string,
+): Promise<string | null> {
+    if (!phoneNumber?.trim()) {
+        return null;
+    }
+
+    const normalizedPhoneNumber = normalizePhoneNumber(phoneNumber);
+    const existing = await queryOne<{ id: string }>(
+        `SELECT id
+         FROM person
+         WHERE phone_number = :phoneNumber
+           AND is_deleted = false
+           AND (:currentPersonId::uuid IS NULL OR id != :currentPersonId::uuid)
+         LIMIT 1`,
+        {
+            phoneNumber: normalizedPhoneNumber,
+            currentPersonId: currentPersonId ?? null,
+        },
+    );
+
+    if (existing) {
+        throw new AppError(
+            'This phone number is already being used by another person',
+            409,
+            'ERR_DUPLICATE_PHONE',
+        );
+    }
+
+    return normalizedPhoneNumber;
+}
+
 function toResponse(row: PersonRow): PersonResponse {
     return {
         id: row.id,
@@ -45,6 +82,8 @@ export async function createPerson(data: {
     location?: string;
     createdBy: string;
 }): Promise<PersonResponse> {
+    const normalizedPhoneNumber = await assertPhoneNumberAvailable(data.phoneNumber);
+
     const row = await queryOne<PersonRow>(
         `INSERT INTO person (
 			first_name,
@@ -83,7 +122,7 @@ export async function createPerson(data: {
             birthDate: data.birthDate ?? null,
             deathYear: data.deathYear ?? null,
             bio: data.bio ?? null,
-            phoneNumber: data.phoneNumber ?? null,
+            phoneNumber: normalizedPhoneNumber,
             socialLinks: JSON.stringify(data.socialLinks ?? null),
             location: data.location ?? null,
             createdBy: data.createdBy,
@@ -165,7 +204,9 @@ export async function updatePerson(
     if (!existing) throw new AppError('Person not found', 404, 'ERR_NOT_FOUND');
 
     const nextPhoneNumber =
-        data.phoneNumber !== undefined ? data.phoneNumber : existing.phone_number;
+        data.phoneNumber !== undefined
+            ? await assertPhoneNumberAvailable(data.phoneNumber, id)
+            : existing.phone_number;
 
     const row = await queryOne<PersonRow>(
         `UPDATE person SET
