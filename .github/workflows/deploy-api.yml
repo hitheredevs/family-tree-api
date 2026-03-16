@@ -1,0 +1,101 @@
+name: Deploy API
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - src/**
+      - package.json
+      - package-lock.json
+      - tsconfig.json
+      - ecosystem.config.cjs
+      - .github/workflows/deploy-api.yml
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-family-tree-api
+  cancel-in-progress: true
+
+jobs:
+  deploy-api:
+    name: Deploy API To VM
+    runs-on: self-hosted
+    env:
+      PROD_ENV: ${{ secrets.PROD_ENV }}
+      PM2_APP_NAME: family-tree-api
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Validate production env secret
+        shell: bash
+        run: |
+          if [ -z "$PROD_ENV" ]; then
+            echo "PROD_ENV secret is not configured"
+            exit 1
+          fi
+
+      - name: Write production env file
+        shell: bash
+        run: |
+          printf '%s' "$PROD_ENV" > .env
+          chmod 600 .env
+
+      - name: Clean previous build leftovers
+        shell: bash
+        run: |
+          rm -rf dist
+          rm -rf node_modules/.cache
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install PM2
+        shell: bash
+        run: |
+          if ! command -v pm2 >/dev/null 2>&1; then
+            npm install --global pm2
+          fi
+
+      - name: Build API
+        run: npm run build
+
+      - name: Start or restart API with PM2
+        shell: bash
+        run: |
+          if pm2 describe "$PM2_APP_NAME" >/dev/null 2>&1; then
+            pm2 restart ecosystem.config.cjs --only "$PM2_APP_NAME" --update-env
+          else
+            pm2 start ecosystem.config.cjs --only "$PM2_APP_NAME"
+          fi
+          pm2 save
+
+      - name: Show PM2 status
+        run: pm2 status
+
+      - name: Clean npm cache and runner temp files
+        if: always()
+        shell: bash
+        run: |
+          npm cache clean --force || true
+
+          if [ -d "$HOME/.npm/_logs" ]; then
+            rm -rf "$HOME/.npm/_logs"
+          fi
+
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "$RUNNER_TEMP" ]; then
+            find "$RUNNER_TEMP" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+          fi
+
+          if [ -n "${RUNNER_TOOL_CACHE:-}" ] && [ -d "$RUNNER_TOOL_CACHE" ]; then
+            find "$RUNNER_TOOL_CACHE" -type f -name '*.tmp' -delete || true
+          fi
