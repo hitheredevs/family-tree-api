@@ -4,6 +4,7 @@ import {
     type PersonRow,
     type RelationshipRow,
     type TreePerson,
+    type TreePersonLayout,
 } from '../types/index.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -13,14 +14,19 @@ const log = createLogger('tree-service');
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-function personToTree(row: PersonRow, rels: RelationshipRow[]): TreePerson {
+/** Columns needed for the slim layout endpoint */
+const LAYOUT_COLS = 'p.id, p.first_name, p.last_name, p.gender, p.is_deceased';
+
+type LayoutRow = Pick<PersonRow, 'id' | 'first_name' | 'last_name' | 'gender' | 'is_deceased'>;
+
+function buildRelationshipArrays(rowId: string, rels: RelationshipRow[]) {
     const parentIds: string[] = [];
     const spouseIds: string[] = [];
     const exSpouseIds: string[] = [];
     const childrenIds: string[] = [];
 
     for (const r of rels) {
-        if (r.source_person_id !== row.id) continue;
+        if (r.source_person_id !== rowId) continue;
         switch (r.relationship_type) {
             case 'CHILD':
                 parentIds.push(r.target_person_id);
@@ -37,6 +43,13 @@ function personToTree(row: PersonRow, rels: RelationshipRow[]): TreePerson {
                 break;
         }
     }
+
+    return { parentIds, spouseIds, exSpouseIds, childrenIds };
+}
+
+function personToTree(row: PersonRow, rels: RelationshipRow[]): TreePerson {
+    const { parentIds, spouseIds, exSpouseIds, childrenIds } =
+        buildRelationshipArrays(row.id, rels);
 
     return {
         id: row.id,
@@ -55,6 +68,23 @@ function personToTree(row: PersonRow, rels: RelationshipRow[]): TreePerson {
         updatedBy: row.updated_by,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        parentIds,
+        spouseIds,
+        exSpouseIds,
+        childrenIds,
+    };
+}
+
+function personToLayout(row: LayoutRow, rels: RelationshipRow[]): TreePersonLayout {
+    const { parentIds, spouseIds, exSpouseIds, childrenIds } =
+        buildRelationshipArrays(row.id, rels);
+
+    return {
+        id: row.id,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        gender: row.gender,
+        isDeceased: row.is_deceased,
         parentIds,
         spouseIds,
         exSpouseIds,
@@ -123,6 +153,63 @@ export async function getSubtree(
         result[p.id] = personToTree(p, allRels);
     }
 
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Slim subtree – only layout + display fields (no bio, phone, etc.) */
+/* ------------------------------------------------------------------ */
+
+export async function getSubtreeLayout(
+    centerId: string,
+): Promise<Record<string, TreePersonLayout>> {
+    const center = await queryOne<LayoutRow>(
+        `SELECT ${LAYOUT_COLS} FROM person p WHERE p.id = :id AND p.is_deleted = false`,
+        { id: centerId },
+    );
+    if (!center) {
+        log.warn('Subtree layout center not found', { centerId });
+        throw new AppError('Person not found', 404, 'ERR_NOT_FOUND');
+    }
+    log.info('Building subtree layout', { centerId });
+
+    const connectedPeople = await queryAll<LayoutRow>(
+        `WITH RECURSIVE connected AS (
+            SELECT p.id
+            FROM person p
+            WHERE p.id = :centerId AND p.is_deleted = false
+
+            UNION
+
+            SELECT p.id
+            FROM relationship r
+            INNER JOIN connected c ON r.source_person_id = c.id
+            INNER JOIN person p ON p.id = r.target_person_id
+            WHERE p.is_deleted = false
+        )
+        SELECT DISTINCT ${LAYOUT_COLS}
+        FROM person p
+        INNER JOIN connected c ON p.id = c.id
+        WHERE p.is_deleted = false`,
+        { centerId },
+    );
+
+    if (connectedPeople.length === 0) return {};
+
+    const idArray = connectedPeople.map((p) => p.id);
+    const allRels = await queryAll<RelationshipRow>(
+        `SELECT r.* FROM relationship r
+         INNER JOIN person p ON p.id = r.target_person_id AND p.is_deleted = false
+         WHERE r.source_person_id = ANY(ARRAY[${idArray.map((_, i) => `:id${i}`).join(',')}]::uuid[])`,
+        Object.fromEntries(idArray.map((id, i) => [`id${i}`, id])),
+    );
+
+    const result: Record<string, TreePersonLayout> = {};
+    for (const p of connectedPeople) {
+        result[p.id] = personToLayout(p, allRels);
+    }
+
+    log.info('Subtree layout built', { centerId, nodeCount: Object.keys(result).length });
     return result;
 }
 

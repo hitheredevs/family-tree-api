@@ -99,6 +99,19 @@ export interface TreePerson extends PersonResponse {
     childrenIds: string[];
 }
 
+/** Slim tree node — only the fields needed for layout + node rendering */
+export interface TreePersonLayout {
+    id: string;
+    firstName: string;
+    lastName: string;
+    gender: string;
+    isDeceased: boolean;
+    parentIds: string[];
+    spouseIds: string[];
+    exSpouseIds: string[];
+    childrenIds: string[];
+}
+
 export interface UserResponse {
     id: string;
     username: string;

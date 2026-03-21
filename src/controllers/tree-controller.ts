@@ -27,6 +27,27 @@ export async function getSubtree(
 }
 
 /* ------------------------------------------------------------------ */
+/*  Get subtree layout (slim – only fields needed for rendering)       */
+/* ------------------------------------------------------------------ */
+
+export async function getSubtreeLayout(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction,
+): Promise<void> {
+    try {
+        const personId = req.params.personId as string;
+        log.info('Fetching subtree layout', { personId });
+        const tree = await treeService.getSubtreeLayout(personId);
+        log.info('Subtree layout fetched', { personId, nodeCount: Object.keys(tree).length });
+        res.json({ people: tree });
+    } catch (err) {
+        log.error('Fetch subtree layout failed', { personId: req.params.personId, error: err instanceof Error ? err.message : String(err) });
+        next(err);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Get ancestors (recursive)                                          */
 /* ------------------------------------------------------------------ */
 

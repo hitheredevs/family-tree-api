@@ -10,6 +10,9 @@ router.use(authMiddleware);
 // GET /api/tree/:personId              — get subtree centered on person
 router.get('/:personId', treeController.getSubtree);
 
+// GET /api/tree/:personId/layout       — slim subtree for tree rendering
+router.get('/:personId/layout', treeController.getSubtreeLayout);
+
 // GET /api/tree/:personId/ancestors    — get recursive ancestors
 router.get('/:personId/ancestors', treeController.getAncestors);
 
