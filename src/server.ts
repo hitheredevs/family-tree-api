@@ -19,12 +19,21 @@ const log = createLogger('server');
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
+app.set('etag', false);
+
 /* ------------------------------------------------------------------ */
 /*  Middleware                                                         */
 /* ------------------------------------------------------------------ */
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+
+app.use('/api', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+});
 
 // HTTP request logging
 app.use(morgan('combined'));
