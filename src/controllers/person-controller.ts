@@ -2,6 +2,7 @@ import type { NextFunction, Response } from 'express';
 import * as personService from '../services/person-service.js';
 import type { AuthenticatedRequest } from '../types/index.js';
 import { assertCanEdit } from '../validators/permission-validator.js';
+import { scheduleRecompute } from '../services/layout-service.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('person-controller');
@@ -46,6 +47,7 @@ export async function create(
         });
 
         log.info('Person created', { personId: person.id, firstName });
+        if (req.user?.personId) scheduleRecompute(req.user.personId);
         res.status(201).json(person);
     } catch (err) {
         log.error('Create person failed', { error: err instanceof Error ? err.message : String(err) });
