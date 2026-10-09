@@ -20,7 +20,7 @@ concurrency:
 jobs:
   deploy-api:
     name: Deploy API To VM
-    runs-on: family-tree-api
+    runs-on: [self-hosted, family-tree-api, aws]
     env:
       PROD_ENV: ${{ secrets.PROD_ENV }}
       PM2_APP_NAME: family-tree-api
