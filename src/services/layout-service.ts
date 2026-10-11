@@ -25,6 +25,10 @@ const MIN_VERT_GAP = 80;
 const NODE_H = 140;
 /** Horizontal gap between disconnected family components */
 const COMPONENT_GAP = 1500;
+/** Initial outward passes (rows placed between parents and children) */
+const LAYOUT_PASSES = 2;
+/** Gauss-Seidel sweeps (top→bottom, then bottom→top) after the initial passes */
+const LAYOUT_SWEEPS = 10;
 
 /* ------------------------------------------------------------------ */
 /*  Internal types                                                     */
@@ -52,22 +56,34 @@ interface NodePosition {
 async function loadAllPeople(): Promise<{
     people: Record<string, LayoutPerson>;
     allIds: string[];
+    stored: Map<string, { x: number | null; y: number | null }>;
 }> {
     // 1. Every non-deleted person — disconnected islands included, so
-    //    nobody is left without layout coordinates.
-    const rows = await queryAll<{ id: string; gender: string }>(
-        `SELECT id, gender FROM person WHERE is_deleted = false`,
+    //    nobody is left without layout coordinates. ORDER BY keeps the
+    //    input order stable: Postgres returns rows in physical order
+    //    otherwise, and every recompute's UPDATE reshuffles that order.
+    const rows = await queryAll<{
+        id: string;
+        gender: string;
+        layout_x: number | null;
+        layout_y: number | null;
+    }>(
+        `SELECT id, gender, layout_x, layout_y FROM person
+         WHERE is_deleted = false
+         ORDER BY id`,
     );
 
-    if (rows.length === 0) return { people: {}, allIds: [] };
+    if (rows.length === 0) return { people: {}, allIds: [], stored: new Map() };
 
     const allIds = rows.map((r) => r.id);
+    const stored = new Map(rows.map((r) => [r.id, { x: r.layout_x, y: r.layout_y }]));
 
     // 2. All relationships between non-deleted people
     const rels = await queryAll<RelationshipRow>(
         `SELECT r.* FROM relationship r
          INNER JOIN person ps ON ps.id = r.source_person_id AND ps.is_deleted = false
-         INNER JOIN person pt ON pt.id = r.target_person_id AND pt.is_deleted = false`,
+         INNER JOIN person pt ON pt.id = r.target_person_id AND pt.is_deleted = false
+         ORDER BY r.source_person_id, r.relationship_type, r.target_person_id`,
     );
 
     // 3. Build lookup
@@ -105,7 +121,33 @@ async function loadAllPeople(): Promise<{
         }
     }
 
-    return { people, allIds };
+    return { people, allIds, stored };
+}
+
+/**
+ * Canonical copy of the graph: people keyed in id order, relative
+ * lists de-duplicated, restricted to known people and sorted. Every
+ * later step iterates these lists, so this makes the layout a pure
+ * function of the data rather than of row order.
+ */
+function normalizePeople(
+    people: Record<string, LayoutPerson>,
+): Record<string, LayoutPerson> {
+    const clean = (ids: string[]) =>
+        [...new Set(ids)].filter((id) => people[id]).sort();
+    const out: Record<string, LayoutPerson> = {};
+    for (const id of Object.keys(people).sort()) {
+        const p = people[id];
+        out[id] = {
+            id,
+            gender: p.gender,
+            parentIds: clean(p.parentIds),
+            childrenIds: clean(p.childrenIds),
+            spouseIds: clean(p.spouseIds),
+            exSpouseIds: clean(p.exSpouseIds),
+        };
+    }
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -175,8 +217,10 @@ function pickPeople(
  * at the origin, smaller islands follow to the right.
  */
 function packComponentLayouts(
-    people: Record<string, LayoutPerson>,
+    input: Record<string, LayoutPerson>,
+    stored?: Map<string, { x: number | null; y: number | null }>,
 ): NodePosition[] {
+    const people = normalizePeople(input);
     const components = connectedComponents(people);
     components.sort(
         (a, b) => b.length - a.length || a[0].localeCompare(b[0]),
@@ -188,7 +232,18 @@ function packComponentLayouts(
     for (let index = 0; index < components.length; index++) {
         const ids = components[index];
         const rootId = chooseComponentRoot(ids, people);
-        const positions = computeLayout(pickPeople(ids, people), rootId);
+        // Stored positions are shifted per component; computeLayout puts
+        // the root at x = 0, so re-base the hints on the root's old x.
+        const rootX = stored?.get(rootId)?.x;
+        let previousX: Map<string, number> | undefined;
+        if (stored && rootX != null) {
+            previousX = new Map();
+            for (const id of ids) {
+                const x = stored.get(id)?.x;
+                if (x != null) previousX.set(id, x - rootX);
+            }
+        }
+        const positions = computeLayout(pickPeople(ids, people), rootId, previousX);
         if (positions.length === 0) continue;
 
         let minX = Infinity;
@@ -216,6 +271,69 @@ function packComponentLayouts(
 /* ------------------------------------------------------------------ */
 /*  Generation assignment (optimized — topological sort for fixup)     */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Process the parent→child graph in topological order and move any
+ * child that is level with or above a parent to one row below it.
+ * O(n + edges). Returns true if anyone moved.
+ */
+function pushChildrenBelowParents(
+    gen: Map<string, number>,
+    people: Record<string, LayoutPerson>,
+): boolean {
+    const inDegree = new Map<string, number>();
+    const childrenOf = new Map<string, string[]>();
+    for (const id of gen.keys()) {
+        inDegree.set(id, 0);
+        childrenOf.set(id, []);
+    }
+    for (const id of gen.keys()) {
+        for (const pid of people[id]?.parentIds ?? []) {
+            if (!gen.has(pid)) continue;
+            childrenOf.get(pid)!.push(id);
+            inDegree.set(id, inDegree.get(id)! + 1);
+        }
+    }
+
+    const queue: string[] = [];
+    for (const [id, deg] of inDegree) if (deg === 0) queue.push(id);
+
+    let moved = false;
+    while (queue.length > 0) {
+        const id = queue.shift()!;
+        const g = gen.get(id)!;
+        for (const cid of childrenOf.get(id)!) {
+            if (gen.get(cid)! <= g) {
+                gen.set(cid, g + 1);
+                moved = true;
+            }
+            const deg = inDegree.get(cid)! - 1;
+            inDegree.set(cid, deg);
+            if (deg === 0) queue.push(cid);
+        }
+    }
+    return moved;
+}
+
+/** Put every spouse / ex-spouse pair on the deeper of their two rows. */
+function alignSpouses(
+    gen: Map<string, number>,
+    people: Record<string, LayoutPerson>,
+): boolean {
+    let moved = false;
+    for (const id of gen.keys()) {
+        for (const sid of [...people[id].spouseIds, ...people[id].exSpouseIds]) {
+            const g = gen.get(id)!;
+            const sg = gen.get(sid);
+            if (sg === undefined || sg === g) continue;
+            const deeper = Math.max(g, sg);
+            gen.set(id, deeper);
+            gen.set(sid, deeper);
+            moved = true;
+        }
+    }
+    return moved;
+}
 
 function assignGenerations(
     people: Record<string, LayoutPerson>,
@@ -245,51 +363,8 @@ function assignGenerations(
         }
     }
 
-    // Phase 1.5 — topological fixup (replaces O(n²) while loop)
-    //
-    // Build a parent→child DAG among assigned nodes, then process in
-    // topological order. Each child's gen = max(parent.gen) + 1 if it
-    // was incorrectly placed at the same level or above a parent.
-    //
-    // This is O(n + edges) instead of O(n²).
-    const inDegree = new Map<string, number>();
-    const childrenOf = new Map<string, string[]>();
-
-    for (const [id] of gen) {
-        inDegree.set(id, 0);
-        childrenOf.set(id, []);
-    }
-
-    for (const [id] of gen) {
-        const person = people[id];
-        if (!person) continue;
-        for (const pid of person.parentIds) {
-            if (!gen.has(pid)) continue;
-            childrenOf.get(pid)!.push(id);
-            inDegree.set(id, (inDegree.get(id) || 0) + 1);
-        }
-    }
-
-    // Kahn's algorithm: start from nodes with no parents in the set
-    const topoQueue: string[] = [];
-    for (const [id, deg] of inDegree) {
-        if (deg === 0) topoQueue.push(id);
-    }
-
-    while (topoQueue.length > 0) {
-        const id = topoQueue.shift()!;
-        const g = gen.get(id)!;
-
-        for (const cid of childrenOf.get(id) || []) {
-            const cg = gen.get(cid)!;
-            if (cg <= g) {
-                gen.set(cid, g + 1);
-            }
-            const newDeg = (inDegree.get(cid) || 1) - 1;
-            inDegree.set(cid, newDeg);
-            if (newDeg === 0) topoQueue.push(cid);
-        }
-    }
+    // Phase 1.5 — children strictly below their parents
+    pushChildrenBelowParents(gen, people);
 
     // Phase 2 — spouse assignment for people only reachable via spouse edges
     const spouseQueue: string[] = [...gen.keys()];
@@ -328,25 +403,16 @@ function assignGenerations(
         }
     }
 
-    // Phase 3 — reconcile cross-generation spouse pairs
-    const reconciled = new Set<string>();
-    for (const [id, g] of gen) {
-        const person = people[id];
-        if (!person) continue;
-        const allSpouses = [...person.spouseIds, ...person.exSpouseIds];
-        for (const sid of allSpouses) {
-            const pairKey = [id, sid].sort().join(',');
-            if (reconciled.has(pairKey)) continue;
-            reconciled.add(pairKey);
-            const sg = gen.get(sid);
-            if (sg === undefined || sg === g) continue;
-            const deeperGen = Math.max(g, sg);
-            if (g < sg) {
-                gen.set(id, deeperGen);
-            } else {
-                gen.set(sid, deeperGen);
-            }
-        }
+    // Phase 3 — spouses share a row AND children stay below parents.
+    // Moving a spouse down can put them level with their own children,
+    // so re-run the parent/child pass until neither step changes
+    // anything. Both only ever move people down, so this settles; the
+    // cap only guards against impossible data (someone married to
+    // their own descendant).
+    for (let pass = 0; pass < 100; pass++) {
+        const spousesMoved = alignSpouses(gen, people);
+        const childrenMoved = pushChildrenBelowParents(gen, people);
+        if (!spousesMoved && !childrenMoved) break;
     }
 
     return gen;
@@ -356,14 +422,14 @@ function assignGenerations(
 /*  Row layout — place units within a generation row                   */
 /* ------------------------------------------------------------------ */
 
+/** Places one generation row into posMap and returns its units in order. */
 function layoutRow(
     ids: string[],
     y: number,
     people: Record<string, LayoutPerson>,
     posMap: Map<string, { x: number; y: number }>,
     hintMap: Map<string, { x: number; y: number }>,
-    positions: NodePosition[],
-) {
+): string[][] {
     const getPos = (id: string) => posMap.get(id) || hintMap.get(id);
 
     const avgXOf = (relIds: string[]): number | null => {
@@ -464,6 +530,32 @@ function layoutRow(
         }
     }
 
+    /* ---- group units by parent family so siblings stay together ---- */
+
+    // A couple where both partners have parents in the tree has two
+    // candidate families. Join the one with more units in this row
+    // (ties → smallest key) instead of joining neither, which used to
+    // float the couple away from both sets of siblings.
+    const unitParentKeys = units.map((unit) => {
+        const keys = new Set<string>();
+        for (const uid of unit) {
+            const p = people[uid];
+            if (p && p.parentIds.length > 0) keys.add(p.parentIds.join(','));
+        }
+        return [...keys].sort();
+    });
+    const keyCount = new Map<string, number>();
+    for (const keys of unitParentKeys) {
+        for (const k of keys) keyCount.set(k, (keyCount.get(k) ?? 0) + 1);
+    }
+    const unitFamilyKeys: string[] = units.map((unit, i) => {
+        const keys = unitParentKeys[i];
+        if (keys.length === 0) return `__indep_${unit[0]}`;
+        return keys.reduce((best, k) =>
+            keyCount.get(k)! > keyCount.get(best)! ? k : best,
+        );
+    });
+
     /* ---- compute ideal center-X for each unit ---- */
 
     const idealXs = units.map((unit) => {
@@ -475,18 +567,11 @@ function layoutRow(
         return xs.length > 0 ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
     });
 
-    /* ---- group units by parent family so siblings stay together ---- */
-
-    const unitFamilyKeys: string[] = units.map((unit) => {
-        const parentSets = new Set<string>();
-        for (const uid of unit) {
-            const p = people[uid];
-            if (p && p.parentIds.length > 0) {
-                parentSets.add([...p.parentIds].sort().join(','));
-            }
-        }
-        if (parentSets.size === 1) return [...parentSets][0];
-        return `__indep_${unit[0]}`;
+    // Tie-break by where the unit sat last pass, so siblings that share
+    // the same ideal keep a stable left-to-right order.
+    const previousXs = units.map((unit) => {
+        const xs = unit.map((uid) => posMap.get(uid)?.x).filter((x): x is number => x !== undefined);
+        return xs.length > 0 ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
     });
 
     const familyGroupMap = new Map<string, number[]>();
@@ -497,7 +582,7 @@ function layoutRow(
     }
 
     const familyGroups = [...familyGroupMap.entries()].map(([_key, indices]) => {
-        indices.sort((a, b) => idealXs[a] - idealXs[b]);
+        indices.sort((a, b) => idealXs[a] - idealXs[b] || previousXs[a] - previousXs[b]);
         const groupIdealX =
             indices.reduce((s, i) => s + idealXs[i], 0) / indices.length;
         return { indices, groupIdealX };
@@ -509,20 +594,29 @@ function layoutRow(
     const sortedUnits = order.map((i) => units[i]);
     const sortedIdealXs = order.map((i) => idealXs[i]);
 
-    /* ---- place units, resolve overlaps left-to-right ---- */
+    /* ---- place units: as close to their ideal X as spacing allows ---- */
+    //
+    // Keeping the order fixed, choose centres that minimise the total
+    // squared distance from each unit's ideal X while keeping at least
+    // H_GAP between neighbours. Shifting unit i by the minimum span of
+    // everything to its left turns the spacing rule into "shifted
+    // centres never decrease", which pool-adjacent-violators solves
+    // exactly in O(n). The old left-to-right push only ever moved
+    // units right, so crowded rows drifted thousands of units away
+    // from the parents/children they were aligned to.
 
     const unitWidths = sortedUnits.map((u) => (u.length - 1) * COUPLE_GAP);
-    const unitCenters: number[] = [];
-
-    for (let i = 0; i < sortedUnits.length; i++) {
-        let cx = sortedIdealXs[i];
-        if (i > 0) {
-            const prevRight = unitCenters[i - 1] + unitWidths[i - 1] / 2;
-            const minCx = prevRight + H_GAP + unitWidths[i] / 2;
-            if (cx < minCx) cx = minCx;
-        }
-        unitCenters.push(cx);
+    const minOffset: number[] = [0];
+    for (let i = 1; i < sortedUnits.length; i++) {
+        minOffset.push(
+            minOffset[i - 1] + unitWidths[i - 1] / 2 + H_GAP + unitWidths[i] / 2,
+        );
     }
+    const shifted = isotonicNonDecreasing(
+        sortedIdealXs.map((x, i) => x - minOffset[i]),
+        sortedUnits.map((u) => u.length),
+    );
+    const unitCenters = shifted.map((s, i) => s + minOffset[i]);
 
     /* ---- assign positions ---- */
 
@@ -532,11 +626,37 @@ function layoutRow(
         const startX = cx - ((unit.length - 1) * COUPLE_GAP) / 2;
 
         for (let j = 0; j < unit.length; j++) {
-            const x = startX + j * COUPLE_GAP;
-            posMap.set(unit[j], { x, y });
-            positions.push({ personId: unit[j], x, y });
+            posMap.set(unit[j], { x: startX + j * COUPLE_GAP, y });
         }
     }
+
+    return sortedUnits;
+}
+
+/**
+ * Weighted isotonic regression (pool adjacent violators): the
+ * non-decreasing sequence closest to `values` in weighted least squares.
+ */
+function isotonicNonDecreasing(values: number[], weights: number[]): number[] {
+    const blocks: { sum: number; weight: number; start: number; end: number }[] = [];
+    for (let i = 0; i < values.length; i++) {
+        blocks.push({ sum: values[i] * weights[i], weight: weights[i], start: i, end: i });
+        while (blocks.length > 1) {
+            const last = blocks[blocks.length - 1];
+            const prev = blocks[blocks.length - 2];
+            if (prev.sum / prev.weight <= last.sum / last.weight) break;
+            prev.sum += last.sum;
+            prev.weight += last.weight;
+            prev.end = last.end;
+            blocks.pop();
+        }
+    }
+    const out = new Array<number>(values.length);
+    for (const b of blocks) {
+        const mean = b.sum / b.weight;
+        for (let i = b.start; i <= b.end; i++) out[i] = mean;
+    }
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -625,6 +745,7 @@ function nudgeOverlappingVerticals(
     people: Record<string, LayoutPerson>,
     posMap: Map<string, { x: number; y: number }>,
     positions: NodePosition[],
+    units: string[][],
 ) {
     const familyMap = new Map<string, { parentIds: string[]; childIds: string[] }>();
     for (const person of Object.values(people)) {
@@ -720,8 +841,20 @@ function nudgeOverlappingVerticals(
         }
     }
 
+    // Move whole units: nudging one spouse alone squeezed couples
+    // together until their nodes overlapped.
+    const unitNudge = new Map<string, number>();
+    for (const unit of units) {
+        let strongest = 0;
+        for (const id of unit) {
+            const n = personNudge.get(id) ?? 0;
+            if (Math.abs(n) > Math.abs(strongest)) strongest = n;
+        }
+        if (strongest !== 0) for (const id of unit) unitNudge.set(id, strongest);
+    }
+
     for (const pos of positions) {
-        const nudge = personNudge.get(pos.personId);
+        const nudge = unitNudge.get(pos.personId);
         if (nudge) {
             pos.x += nudge;
             const mapEntry = posMap.get(pos.personId);
@@ -737,6 +870,7 @@ function nudgeOverlappingVerticals(
 function computeLayout(
     people: Record<string, LayoutPerson>,
     centerId: string,
+    previousX?: Map<string, number>,
 ): NodePosition[] {
     if (!people[centerId]) return [];
 
@@ -757,25 +891,51 @@ function computeLayout(
         return da !== db ? da - db : a - b;
     });
 
-    // Step 4 & 5: two-pass layout
+    // Step 4: initial passes, outward from the center, each row placed
+    // between its parents and children
     let posMap = new Map<string, { x: number; y: number }>();
-    let positions: NodePosition[] = [];
 
-    for (let pass = 0; pass < 2; pass++) {
+    for (let pass = 0; pass < LAYOUT_PASSES; pass++) {
+        // Pass 0 starts from last time's positions when we have them, so
+        // one edit nudges the tree instead of rebuilding it from scratch.
         const hintMap =
             pass > 0
                 ? new Map(posMap)
-                : new Map<string, { x: number; y: number }>();
+                : new Map(
+                      [...(previousX ?? new Map<string, number>())].map(
+                          ([id, x]) => [id, { x, y: 0 }] as const,
+                      ),
+                  );
         posMap = new Map();
-        positions = [];
 
         for (const g of sortedGens) {
-            layoutRow(rows.get(g)!, g * V_GAP, people, posMap, hintMap, positions);
+            layoutRow(rows.get(g)!, g * V_GAP, people, posMap, hintMap);
         }
     }
 
+    // Step 5: sweep the rows top→bottom then bottom→top, updating in
+    // place, so each row settles against its neighbours' latest
+    // positions. Measured on the live tree (1,475 people): average
+    // child-to-parents offset 29 → ~11.5 node widths.
+    const topDown = [...rows.keys()].sort((a, b) => a - b);
+    const bottomUp = [...topDown].reverse();
+    for (let sweep = 0; sweep < LAYOUT_SWEEPS; sweep++) {
+        for (const g of topDown) layoutRow(rows.get(g)!, g * V_GAP, people, posMap, posMap);
+        for (const g of bottomUp) layoutRow(rows.get(g)!, g * V_GAP, people, posMap, posMap);
+    }
+    const units: string[][] = [];
+    for (const g of topDown) {
+        units.push(...layoutRow(rows.get(g)!, g * V_GAP, people, posMap, posMap));
+    }
+
+    const positions: NodePosition[] = [...posMap].map(([personId, p]) => ({
+        personId,
+        x: p.x,
+        y: p.y,
+    }));
+
     // Step 5.5: nudge overlapping verticals
-    nudgeOverlappingVerticals(people, posMap, positions);
+    nudgeOverlappingVerticals(people, posMap, positions, units);
 
     // Step 6: shift so center is at (0, 0)
     const centerPos = posMap.get(centerId);
@@ -800,34 +960,70 @@ interface RecomputeResult {
     durationMs: number;
 }
 
-async function doRecompute(): Promise<RecomputeResult> {
+interface RecomputeOptions {
+    /** Ignore stored positions and lay the tree out from scratch. */
+    fresh?: boolean;
+}
+
+/** Positions closer than this to the stored ones are not rewritten. */
+const MIN_MOVE = 1;
+/** Warm passes after a fresh layout so it starts from a resting point. */
+const FRESH_SETTLE_PASSES = 5;
+
+async function doRecompute(options: RecomputeOptions = {}): Promise<RecomputeResult> {
     const start = Date.now();
 
-    const { people } = await loadAllPeople();
+    const { people, stored } = await loadAllPeople();
 
     if (Object.keys(people).length === 0) {
         log.warn('No people found for layout');
         return { nodeCount: 0, durationMs: Date.now() - start };
     }
 
-    const positions = packComponentLayouts(people);
-
-    // Batch-update positions in DB
-    // Build a single UPDATE using unnest for efficiency
-    if (positions.length > 0) {
-        const ids: string[] = [];
-        const xs: number[] = [];
-        const ys: number[] = [];
-
-        for (const pos of positions) {
-            ids.push(pos.personId);
-            xs.push(Math.round(pos.x * 100) / 100);
-            ys.push(Math.round(pos.y * 100) / 100);
+    // Start from the stored positions so an edit only nudges nearby
+    // people; a fresh run is for resets (e.g. after an algorithm change).
+    let positions = packComponentLayouts(people, options.fresh ? undefined : stored);
+    if (options.fresh) {
+        // A from-scratch layout isn't a resting point for the warm-started
+        // recomputes that follow, so the first edit after a reset would
+        // still reshuffle the tree. A few warm passes settle it first
+        // (measured: the next no-change recompute then moves ~0 rows).
+        for (let i = 0; i < FRESH_SETTLE_PASSES; i++) {
+            const settled = new Map(
+                positions.map((p) => [
+                    p.personId,
+                    { x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100 },
+                ]),
+            );
+            positions = packComponentLayouts(people, settled);
         }
+    }
+
+    // Write only rows that actually moved. updated_at is left alone —
+    // it records edits to the person, not where the canvas draws them.
+    const changed = positions
+        .map((pos) => ({
+            id: pos.personId,
+            x: Math.round(pos.x * 100) / 100,
+            y: Math.round(pos.y * 100) / 100,
+        }))
+        .filter(({ id, x, y }) => {
+            const old = stored.get(id);
+            return (
+                !old || old.x == null || old.y == null ||
+                Math.abs(old.x - x) >= MIN_MOVE || Math.abs(old.y - y) >= MIN_MOVE
+            );
+        });
+
+    // Build a single UPDATE using unnest for efficiency
+    if (changed.length > 0) {
+        const ids = changed.map((c) => c.id);
+        const xs = changed.map((c) => c.x);
+        const ys = changed.map((c) => c.y);
 
         await execute(
             `UPDATE person
-             SET layout_x = data.x, layout_y = data.y, updated_at = NOW()
+             SET layout_x = data.x, layout_y = data.y
              FROM (
                 SELECT unnest(ARRAY[${ids.map((_, i) => `:id${i}`).join(',')}]::uuid[]) AS pid,
                        unnest(ARRAY[${xs.map((_, i) => `:x${i}`).join(',')}]::float8[]) AS x,
@@ -845,6 +1041,8 @@ async function doRecompute(): Promise<RecomputeResult> {
     const durationMs = Date.now() - start;
     log.info('Layout recomputed', {
         nodeCount: positions.length,
+        moved: changed.length,
+        fresh: Boolean(options.fresh),
         durationMs,
     });
     return { nodeCount: positions.length, durationMs };
@@ -855,14 +1053,20 @@ async function doRecompute(): Promise<RecomputeResult> {
  * shared promise resolves. */
 let _inFlight: Promise<RecomputeResult> | null = null;
 let _rerunRequested = false;
+let _freshRequested = false;
 
 /**
  * Recompute layout for ALL non-deleted people (every connected
  * component, islands included) and store results in the `layout_x`,
- * `layout_y` columns of the `person` table. The layout is
- * deterministic regardless of which person/user triggered it.
+ * `layout_y` columns of the `person` table. For the same data and
+ * stored positions the result is the same, whichever person or user
+ * triggered it.
  */
-export async function recomputeLayout(_centerId?: string): Promise<RecomputeResult> {
+export async function recomputeLayout(
+    _centerId?: string,
+    options: RecomputeOptions = {},
+): Promise<RecomputeResult> {
+    if (options.fresh) _freshRequested = true;
     if (_inFlight) {
         _rerunRequested = true;
         return _inFlight;
@@ -872,7 +1076,9 @@ export async function recomputeLayout(_centerId?: string): Promise<RecomputeResu
         let result: RecomputeResult;
         do {
             _rerunRequested = false;
-            result = await doRecompute();
+            const fresh = _freshRequested;
+            _freshRequested = false;
+            result = await doRecompute({ fresh });
         } while (_rerunRequested);
         return result;
     })().finally(() => {
@@ -988,3 +1194,7 @@ export async function getAllEdges(): Promise<ViewportEdge[]> {
         status: e.status,
     }));
 }
+
+/* Exported for offline layout checks (scripts/tests); not part of the HTTP API. */
+export { packComponentLayouts };
+export type { LayoutPerson, NodePosition };

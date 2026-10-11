@@ -1,4 +1,4 @@
-import { Sequelize, QueryTypes } from 'sequelize';
+import { Sequelize, QueryTypes, type Transaction } from 'sequelize';
 import dns from 'dns/promises';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -85,15 +85,22 @@ export function getDb(): Promise<Sequelize> {
 /*  Query helpers — all DB access goes through these                    */
 /* ------------------------------------------------------------------ */
 
+/** Pass a transaction to run the statement inside it. */
+export interface QueryOptions {
+    transaction?: Transaction;
+}
+
 /** SELECT — returns array of typed rows */
 export async function queryAll<T>(
     sql: string,
     replacements?: Record<string, unknown>,
+    options: QueryOptions = {},
 ): Promise<T[]> {
     const db = await getDb();
     const results = await db.query(sql, {
         replacements,
         type: QueryTypes.SELECT,
+        transaction: options.transaction,
     });
     return results as T[];
 }
@@ -102,8 +109,9 @@ export async function queryAll<T>(
 export async function queryOne<T>(
     sql: string,
     replacements?: Record<string, unknown>,
+    options: QueryOptions = {},
 ): Promise<T | null> {
-    const rows = await queryAll<T>(sql, replacements);
+    const rows = await queryAll<T>(sql, replacements, options);
     return rows[0] ?? null;
 }
 
@@ -111,7 +119,23 @@ export async function queryOne<T>(
 export async function execute(
     sql: string,
     replacements?: Record<string, unknown>,
+    options: QueryOptions = {},
 ): Promise<void> {
     const db = await getDb();
-    await db.query(sql, { replacements });
+    await db.query(sql, { replacements, transaction: options.transaction });
+}
+
+/**
+ * Run `fn` in one transaction: committed if it resolves, rolled back if
+ * it throws. With `parent`, joins that transaction instead of opening a
+ * new one, so helpers can be called both standalone and from a larger
+ * all-or-nothing operation.
+ */
+export async function withTransaction<T>(
+    fn: (t: Transaction) => Promise<T>,
+    parent?: Transaction,
+): Promise<T> {
+    if (parent) return fn(parent);
+    const db = await getDb();
+    return db.transaction((t) => fn(t));
 }

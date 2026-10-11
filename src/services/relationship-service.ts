@@ -1,4 +1,5 @@
-import { getDb, queryAll, queryOne, execute } from '../db/connection.js';
+import type { Transaction } from 'sequelize';
+import { getDb, queryAll, queryOne, execute, withTransaction } from '../db/connection.js';
 import { AppError, type RelationshipRow, type RelationshipStatus, type RelationshipType } from '../types/index.js';
 import {
     assertNoCycle,
@@ -24,12 +25,15 @@ const INVERSE: Record<RelationshipType, RelationshipType> = {
 /*  Add relationship (with full validation)                            */
 /* ------------------------------------------------------------------ */
 
-export async function addRelationship(data: {
-    sourcePersonId: string;
-    targetPersonId: string;
-    relationshipType: RelationshipType;
-    createdBy: string;
-}): Promise<{ forward: RelationshipRow; inverse: RelationshipRow }> {
+export async function addRelationship(
+    data: {
+        sourcePersonId: string;
+        targetPersonId: string;
+        relationshipType: RelationshipType;
+        createdBy: string;
+    },
+    parent?: Transaction,
+): Promise<{ forward: RelationshipRow; inverse: RelationshipRow }> {
     const { sourcePersonId, targetPersonId, relationshipType, createdBy } = data;
 
     // Self-reference guard
@@ -41,89 +45,77 @@ export async function addRelationship(data: {
         );
     }
 
-    // Ensure both persons exist
-    const srcExists = await queryOne(
-        `SELECT id FROM person WHERE id = :id AND is_deleted = false`,
-        { id: sourcePersonId },
-    );
-    const tgtExists = await queryOne(
-        `SELECT id FROM person WHERE id = :id AND is_deleted = false`,
-        { id: targetPersonId },
-    );
+    // Checks and both inserts share one transaction (the caller's, when
+    // it passes one), so a batch either lands completely or not at all.
+    return withTransaction(async (t) => {
+        const opts = { transaction: t };
 
-    if (!srcExists || !tgtExists) {
-        throw new AppError('One or both persons not found', 404, 'ERR_NOT_FOUND');
-    }
-
-    // Type-specific validations
-    if (relationshipType === 'PARENT') {
-        // source is PARENT of target → check cycle: target must not be ancestor of source
-        await assertNoCycle(sourcePersonId, targetPersonId);
-        // target gains a parent → check max parents
-        await assertMaxParents(targetPersonId);
-    } else if (relationshipType === 'CHILD') {
-        // source is CHILD of target → target is PARENT of source
-        await assertNoCycle(targetPersonId, sourcePersonId);
-        await assertMaxParents(sourcePersonId);
-    } else if (relationshipType === 'SPOUSE') {
-        await assertMaxSpouses(sourcePersonId);
-        await assertMaxSpouses(targetPersonId);
-    }
-
-    // Duplicate check for both directions
-    await assertNoDuplicate(sourcePersonId, targetPersonId, relationshipType);
-    await assertNoDuplicate(
-        targetPersonId,
-        sourcePersonId,
-        INVERSE[relationshipType],
-    );
-
-    // Insert both directions in a transaction
-    const db = await getDb();
-    const t = await db.transaction();
-
-    try {
-        const forwardRows = await db.query(
-            `INSERT INTO relationship (source_person_id, target_person_id, relationship_type, created_by)
-       VALUES (:source, :target, :type, :createdBy)
-       RETURNING *`,
-            {
-                replacements: {
-                    source: sourcePersonId,
-                    target: targetPersonId,
-                    type: relationshipType,
-                    createdBy,
-                },
-                transaction: t,
-            },
+        // Ensure both persons exist
+        const srcExists = await queryOne(
+            `SELECT id FROM person WHERE id = :id AND is_deleted = false`,
+            { id: sourcePersonId },
+            opts,
+        );
+        const tgtExists = await queryOne(
+            `SELECT id FROM person WHERE id = :id AND is_deleted = false`,
+            { id: targetPersonId },
+            opts,
         );
 
-        const inverseRows = await db.query(
-            `INSERT INTO relationship (source_person_id, target_person_id, relationship_type, created_by)
-       VALUES (:source, :target, :type, :createdBy)
-       RETURNING *`,
-            {
-                replacements: {
+        if (!srcExists || !tgtExists) {
+            throw new AppError('One or both persons not found', 404, 'ERR_NOT_FOUND');
+        }
+
+        // Type-specific validations
+        if (relationshipType === 'PARENT') {
+            // source is PARENT of target → check cycle: target must not be ancestor of source
+            await assertNoCycle(sourcePersonId, targetPersonId, t);
+            // target gains a parent → check max parents
+            await assertMaxParents(targetPersonId, 2, t);
+        } else if (relationshipType === 'CHILD') {
+            // source is CHILD of target → target is PARENT of source
+            await assertNoCycle(targetPersonId, sourcePersonId, t);
+            await assertMaxParents(sourcePersonId, 2, t);
+        } else if (relationshipType === 'SPOUSE') {
+            await assertMaxSpouses(sourcePersonId, 2, t);
+            await assertMaxSpouses(targetPersonId, 2, t);
+        }
+
+        // Duplicate check for both directions
+        await assertNoDuplicate(sourcePersonId, targetPersonId, relationshipType, t);
+        await assertNoDuplicate(
+            targetPersonId,
+            sourcePersonId,
+            INVERSE[relationshipType],
+            t,
+        );
+
+        try {
+            const forward = await queryOne<RelationshipRow>(
+                `INSERT INTO relationship (source_person_id, target_person_id, relationship_type, created_by)
+           VALUES (:source, :target, :type, :createdBy)
+           RETURNING *`,
+                { source: sourcePersonId, target: targetPersonId, type: relationshipType, createdBy },
+                opts,
+            );
+            const inverse = await queryOne<RelationshipRow>(
+                `INSERT INTO relationship (source_person_id, target_person_id, relationship_type, created_by)
+           VALUES (:source, :target, :type, :createdBy)
+           RETURNING *`,
+                {
                     source: targetPersonId,
                     target: sourcePersonId,
                     type: INVERSE[relationshipType],
                     createdBy,
                 },
-                transaction: t,
-            },
-        );
-
-        await t.commit();
-
-        const forward = (forwardRows[0] as RelationshipRow[])[0];
-        const inverse = (inverseRows[0] as RelationshipRow[])[0];
-
-        return { forward, inverse };
-    } catch (err) {
-        await t.rollback();
-        log.error('Add relationship transaction failed', { sourcePersonId, targetPersonId, relationshipType, error: err instanceof Error ? err.message : String(err) });
-        throw err;
-    }
+                opts,
+            );
+            return { forward: forward!, inverse: inverse! };
+        } catch (err) {
+            log.error('Add relationship insert failed', { sourcePersonId, targetPersonId, relationshipType, error: err instanceof Error ? err.message : String(err) });
+            throw err;
+        }
+    }, parent);
 }
 
 /* ------------------------------------------------------------------ */
@@ -198,21 +190,25 @@ export async function updateRelationshipStatus(
     targetPersonId: string,
     status: RelationshipStatus,
 ): Promise<void> {
-    // Update both directions
-    await execute(
-        `UPDATE relationship
-         SET status = :status, updated_at = NOW()
-         WHERE source_person_id = :source
-           AND target_person_id = :target
-           AND relationship_type = 'SPOUSE'`,
-        { status, source: sourcePersonId, target: targetPersonId },
-    );
-    await execute(
-        `UPDATE relationship
-         SET status = :status, updated_at = NOW()
-         WHERE source_person_id = :target
-           AND target_person_id = :source
-           AND relationship_type = 'SPOUSE'`,
-        { status, source: sourcePersonId, target: targetPersonId },
-    );
+    // Update both directions together, so the pair can't disagree
+    await withTransaction(async (t) => {
+        await execute(
+            `UPDATE relationship
+             SET status = :status, updated_at = NOW()
+             WHERE source_person_id = :source
+               AND target_person_id = :target
+               AND relationship_type = 'SPOUSE'`,
+            { status, source: sourcePersonId, target: targetPersonId },
+            { transaction: t },
+        );
+        await execute(
+            `UPDATE relationship
+             SET status = :status, updated_at = NOW()
+             WHERE source_person_id = :target
+               AND target_person_id = :source
+               AND relationship_type = 'SPOUSE'`,
+            { status, source: sourcePersonId, target: targetPersonId },
+            { transaction: t },
+        );
+    });
 }
