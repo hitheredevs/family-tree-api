@@ -5,6 +5,7 @@ import type { AuthenticatedRequest, RelationshipType } from '../types/index.js';
 import { assertCanEdit } from '../validators/permission-validator.js';
 import { assertMaxParents, assertMaxSpouses } from '../validators/graph-validator.js';
 import { recomputeLayout } from '../services/layout-service.js';
+import { withTransaction } from '../db/connection.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('person-controller');
@@ -116,21 +117,26 @@ export async function createWithRelations(
             userId: req.user!.userId,
         });
 
-        const created = await personService.createPerson({
-            ...(person as object),
-            createdBy: req.user!.userId,
-        } as Parameters<typeof personService.createPerson>[0]);
-
-        const relationships = [];
-        for (const rel of relationList) {
-            const result = await relationshipService.addRelationship({
-                sourcePersonId: created.id,
-                targetPersonId: rel.targetPersonId,
-                relationshipType: rel.relationshipType,
+        // Person + every link in one transaction: if any link is rejected
+        // nothing is saved, instead of leaving a half-linked person behind.
+        const { created, relationships } = await withTransaction(async (t) => {
+            const created = await personService.createPerson({
+                ...(person as object),
                 createdBy: req.user!.userId,
-            });
-            relationships.push(result.forward);
-        }
+            } as Parameters<typeof personService.createPerson>[0], t);
+
+            const relationships = [];
+            for (const rel of relationList) {
+                const result = await relationshipService.addRelationship({
+                    sourcePersonId: created.id,
+                    targetPersonId: rel.targetPersonId,
+                    relationshipType: rel.relationshipType,
+                    createdBy: req.user!.userId,
+                }, t);
+                relationships.push(result.forward);
+            }
+            return { created, relationships };
+        });
 
         await recomputeLayout();
         log.info('Person created with relations', {
@@ -142,10 +148,6 @@ export async function createWithRelations(
         log.error('Create person with relations failed', {
             error: err instanceof Error ? err.message : String(err),
         });
-        // Position whatever was created before the failure
-        try {
-            await recomputeLayout();
-        } catch { /* best effort */ }
         next(err);
     }
 }
@@ -235,6 +237,32 @@ export async function remove(
         res.json({ message: 'Person deleted' });
     } catch (err) {
         log.error('Delete person failed', { personId: req.params.id, error: err instanceof Error ? err.message : String(err) });
+        next(err);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Merge a duplicate into another person (admin only)                 */
+/* ------------------------------------------------------------------ */
+
+export async function merge(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction,
+): Promise<void> {
+    try {
+        const duplicateId = req.params.id as string;
+        const { keepId } = req.body as { keepId?: string };
+        if (!keepId) {
+            res.status(400).json({ error: 'keepId is required' });
+            return;
+        }
+        log.info('Merging person', { duplicateId, keepId, userId: req.user!.userId });
+        const result = await personService.mergePerson(duplicateId, keepId, req.user!.userId);
+        await recomputeLayout();
+        res.json(result);
+    } catch (err) {
+        log.error('Merge person failed', { personId: req.params.id, error: err instanceof Error ? err.message : String(err) });
         next(err);
     }
 }

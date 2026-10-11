@@ -2,6 +2,7 @@ import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest, RelationshipType } from '../types/index.js';
 import * as relationshipService from '../services/relationship-service.js';
 import { recomputeLayout } from '../services/layout-service.js';
+import { withTransaction } from '../db/connection.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('relationship-controller');
@@ -93,21 +94,22 @@ export async function addBatch(
             userId: req.user!.userId,
         });
 
-        const results = [];
-        try {
+        // All or nothing: a rejected link rolls back the ones before it,
+        // so a failed save never leaves partial links the user can't undo.
+        const results = await withTransaction(async (t) => {
+            const rows = [];
             for (const rel of relationships) {
                 const result = await relationshipService.addRelationship({
                     sourcePersonId: rel.sourcePersonId,
                     targetPersonId: rel.targetPersonId,
                     relationshipType: rel.relationshipType as RelationshipType,
                     createdBy: req.user!.userId,
-                });
-                results.push(result.forward);
+                }, t);
+                rows.push(result.forward);
             }
-        } finally {
-            // One layout pass whether everything or only part succeeded
-            if (results.length > 0) await recomputeLayout();
-        }
+            return rows;
+        });
+        await recomputeLayout();
 
         log.info('Relationship batch added', { count: results.length });
         res.status(201).json({ relationships: results });

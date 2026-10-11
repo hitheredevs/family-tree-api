@@ -25,4 +25,7 @@ router.put('/:id', personController.update);
 // DELETE /api/persons/:id      — soft-delete (admin only)
 router.delete('/:id', adminOnly, personController.remove);
 
+// POST /api/persons/:id/merge  { keepId } — move :id's links onto keepId, retire :id
+router.post('/:id/merge', adminOnly, personController.merge);
+
 export default router;
