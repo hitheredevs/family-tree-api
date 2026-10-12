@@ -15,7 +15,9 @@ import { hashPasswordLinkToken } from '../utils/password-link.js';
 const log = createLogger('auth-service');
 
 const JWT_SECRET = process.env.JWT_SECRET ?? 'fallback-secret';
-const TOKEN_EXPIRY = '7d';
+// Sliding session: the app swaps in a fresh token (POST /auth/refresh) at
+// least once a day while it is used, so only a month of no use signs out.
+const TOKEN_EXPIRY = '30d';
 
 function normalizePhoneNumber(phoneNumber: string): string {
     const normalized = phoneNumber.trim().replace(/[\s()-]/g, '');
@@ -155,6 +157,32 @@ export async function login(
         token,
         user: toUserResponse(row),
     };
+}
+
+/**
+ * New token for a still-valid session. Re-reads the user so role changes
+ * apply; a removed account gets a 401 and the app signs out.
+ */
+export async function refreshSession(userId: string): Promise<{ token: string; user: UserResponse }> {
+    let row: UserRow;
+    try {
+        row = await getUserWithPersonByUserId(userId);
+    } catch (err) {
+        if (err instanceof AppError && err.statusCode === 404) {
+            throw new AppError('Your account no longer exists', 401, 'ERR_AUTH');
+        }
+        throw err;
+    }
+
+    const payload: AuthPayload = {
+        userId: row.id,
+        personId: row.person_id,
+        role: row.role,
+    };
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+    log.info('JWT refreshed', { userId: row.id });
+
+    return { token, user: toUserResponse(row) };
 }
 
 export async function getCurrentUser(userId: string): Promise<UserResponse> {

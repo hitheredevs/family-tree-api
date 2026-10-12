@@ -57,6 +57,22 @@ export async function getMe(
     }
 }
 
+export async function refresh(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction,
+): Promise<void> {
+    try {
+        if (!req.user) {
+            res.status(401).json({ error: 'Not authenticated' });
+            return;
+        }
+        res.json(await authService.refreshSession(req.user.userId));
+    } catch (err) {
+        next(err);
+    }
+}
+
 export function logout(
     _req: Request,
     res: Response,
