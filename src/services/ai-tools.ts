@@ -131,6 +131,61 @@ export const AI_TOOLS = [
     },
 ];
 
+/** Only offered to admins (and refused for everyone else in runTool). */
+export const ADMIN_AI_TOOLS = [
+    {
+        type: 'function',
+        function: {
+            name: 'same_generation_relatives',
+            description:
+                "Admin only. Everyone in the same generation as a person across EVERY branch of the family, as far back as the tree goes: siblings, first cousins, second cousins, third cousins… (people who share an ancestor the same number of generations up). Each person is counted once, at their closest shared ancestor. Returns exact totals per level, the ancestor branches they come through, paternal/maternal side, living/deceased, and a paged list. Use for 'how many cousins do I have', far/distant cousins, 'everyone at my level'. The totals are exact — report them, don't recount.",
+            parameters: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Person id from another tool' },
+                    include_siblings: { type: 'boolean', description: 'Count brothers and sisters too (default true)' },
+                    max_level: {
+                        type: 'integer',
+                        description: 'Stop this many generations up (2 = up to first cousins). Default: as far as the tree goes',
+                    },
+                    living: { type: 'boolean', description: 'true = living only, false = deceased only' },
+                    list_level: {
+                        type: 'integer',
+                        description: 'Only list people at this level (1 = siblings, 2 = first cousins, 3 = second cousins…); totals still cover every level',
+                    },
+                    list_side: { type: 'string', enum: ['paternal', 'maternal', 'both'], description: "Only list people on this parent's side" },
+                    limit: { type: 'integer', description: 'People listed (default 40, max 200)' },
+                    offset: { type: 'integer', description: 'Skip this many people in the list, for "show more"' },
+                },
+                required: ['id'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'relatives_at_distance',
+            description:
+                'Admin only. People whose closest shared ancestor with the person is exactly `up` generations above the person and `down` generations above them. Examples: up 3 down 3 = second cousins (same generation); up 2 down 1 = aunts/uncles; up 3 down 2 = first cousins once removed, a generation OLDER (parents\' first cousins); up 2 down 3 = first cousins once removed, a generation YOUNGER (first cousins\' children); up 0 = descendants; down 0 = ancestors. Returns an exact count, living/deceased, sides, ancestor branches and a paged list.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' },
+                    up: { type: 'integer', description: 'Generations up to the shared ancestor (0-15)' },
+                    down: { type: 'integer', description: 'Generations down from it to the relatives (0-15)' },
+                    living: { type: 'boolean', description: 'true = living only, false = deceased only' },
+                    list_side: { type: 'string', enum: ['paternal', 'maternal', 'both'], description: "Only list people on this parent's side" },
+                    limit: { type: 'integer', description: 'People listed (default 40, max 200)' },
+                    offset: { type: 'integer', description: 'Skip this many people in the list, for "show more"' },
+                },
+                required: ['id', 'up', 'down'],
+            },
+        },
+    },
+];
+
+const ADMIN_TOOL_NAMES = new Set(ADMIN_AI_TOOLS.map((t) => t.function.name));
+
 /** Short line shown in the chat while a tool runs, e.g. "Searching for FAZAL…" */
 export function describeToolCall(name: string, args: Record<string, unknown>, graph?: FamilyGraph): string {
     const nameOf = (v: unknown) => {
@@ -158,6 +213,10 @@ export function describeToolCall(name: string, args: Record<string, unknown>, gr
             return 'Filtering the family';
         case 'family_stats':
             return 'Counting the whole family';
+        case 'same_generation_relatives':
+            return `Counting ${nameOf(args.id)}'s generation across every branch`;
+        case 'relatives_at_distance':
+            return `Finding ${nameOf(args.id)}'s ${distanceLabel(clampInt(args.up, 0, 0, 15), clampInt(args.down, 0, 0, 15))}`;
         default:
             return 'Looking it up';
     }
@@ -737,16 +796,343 @@ function familyStats(graph: FamilyGraph): ToolResult {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Admin: relatives by generation distance                            */
+/*                                                                     */
+/*  levels[k] = everyone exactly k generations above the person (any   */
+/*  line). Going `up` then `down` reaches everyone who shares one of    */
+/*  those ancestors; anyone also reachable through a closer shared      */
+/*  ancestor at the same generation offset belongs to that closer      */
+/*  level instead, so each person is counted once.                     */
+/* ------------------------------------------------------------------ */
+
+const MAX_GENERATIONS = 15;
+const ORDINAL_WORDS = ['', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth'];
+const TIMES_WORDS = ['', 'once', 'twice', 'three times', 'four times', 'five times'];
+const PLACEHOLDER_NAME = /^(father|mother|son|daughter|husband|wife|brother|sister|child|baby|unknown|n\/?a)$/i;
+
+function greatsPrefix(n: number): string {
+    if (n <= 0) return '';
+    if (n === 1) return 'great-';
+    if (n === 2) return 'great-great-';
+    return `${n}× great-`;
+}
+
+/** Plural name for "shared ancestor `up` above me, `down` above them". */
+function distanceLabel(up: number, down: number): string {
+    if (up === 0 && down === 0) return 'self';
+    if (up === 0) return down === 1 ? 'children' : `${greatsPrefix(down - 2)}grandchildren`;
+    if (down === 0) return up === 1 ? 'parents' : `${greatsPrefix(up - 2)}grandparents`;
+    if (up === 1 && down === 1) return 'siblings';
+    if (up === 1) return down === 2 ? 'nephews and nieces' : `${greatsPrefix(down - 2)}grand-nephews and nieces`;
+    if (down === 1) return up === 2 ? 'aunts and uncles' : `${greatsPrefix(up - 3)}great-aunts and uncles`;
+    const degree = Math.min(up, down) - 1;
+    const removed = Math.abs(up - down);
+    let label = `${ORDINAL_WORDS[degree] ?? `${degree}th`} cousins`;
+    if (removed) {
+        label += ` ${TIMES_WORDS[removed] ?? `${removed} times`} removed (${up > down ? 'older' : 'younger'} generation)`;
+    }
+    return label;
+}
+
+function parentsOfSet(graph: FamilyGraph, ids: Iterable<string>): Set<string> {
+    const out = new Set<string>();
+    for (const id of ids) for (const p of graph.people.get(id)?.parentIds ?? []) if (graph.people.has(p)) out.add(p);
+    return out;
+}
+
+function childrenOfSet(graph: FamilyGraph, ids: Iterable<string>): Set<string> {
+    const out = new Set<string>();
+    for (const id of ids) for (const c of graph.people.get(id)?.childrenIds ?? []) if (graph.people.has(c)) out.add(c);
+    return out;
+}
+
+function ancestorLevels(graph: FamilyGraph, id: string): Set<string>[] {
+    const levels = [new Set([id])];
+    while (levels.length <= MAX_GENERATIONS) {
+        const next = parentsOfSet(graph, levels[levels.length - 1]);
+        if (next.size === 0) break;
+        levels.push(next);
+    }
+    return levels;
+}
+
+function downFrom(graph: FamilyGraph, start: Set<string>, steps: number): Set<string> {
+    let current = start;
+    for (let i = 0; i < steps && current.size; i++) current = childrenOfSet(graph, current);
+    return current;
+}
+
+/** Up `up`, down `down`, minus anyone closer at the same generation offset, minus the person. */
+function relativesAtDistance(graph: FamilyGraph, levels: Set<string>[], personId: string, up: number, down: number): Set<string> {
+    if (up >= levels.length) return new Set();
+    const result = new Set(downFrom(graph, levels[up], down));
+    for (let k = 1; k <= Math.min(up, down); k++) {
+        for (const id of downFrom(graph, levels[up - k], down - k)) result.delete(id);
+    }
+    result.delete(personId);
+    return result;
+}
+
+interface SideSets {
+    fatherName: string | null;
+    motherName: string | null;
+    side: (id: string) => 'paternal' | 'maternal' | 'both' | null;
+}
+
+/** Which parent's line reaches each relative at this (up, down). */
+function sidesAt(graph: FamilyGraph, p: GraphPerson, up: number, down: number): SideSets {
+    const { father, mother } = parentsOf(graph, p);
+    const reach = (parent: GraphPerson | null) => {
+        if (!parent || up < 1) return new Set<string>();
+        const levels = ancestorLevels(graph, parent.id);
+        return up - 1 < levels.length ? downFrom(graph, levels[up - 1], down) : new Set<string>();
+    };
+    const viaFather = reach(father);
+    const viaMother = reach(mother);
+    return {
+        fatherName: father?.name ?? null,
+        motherName: mother?.name ?? null,
+        side: (id) => {
+            const f = viaFather.has(id);
+            const m = viaMother.has(id);
+            return f && m ? 'both' : f ? 'paternal' : m ? 'maternal' : null;
+        },
+    };
+}
+
+interface Branch {
+    label: string;
+    refs: string[];
+    members: Set<string>;
+}
+
+/** Branch summary for tool output, with the side most of its people are on. */
+function describeBranch(b: Branch, sides: SideSets | null) {
+    const counts = new Map<string, number>();
+    if (sides) for (const id of b.members) {
+        const side = sides.side(id);
+        if (side) counts.set(side, (counts.get(side) ?? 0) + 1);
+    }
+    const side = [...counts].sort((x, y) => y[1] - x[1])[0]?.[0];
+    return { ancestors: b.label, ids: b.refs, count: b.members.size, ...(side ? { side } : {}) };
+}
+
+const SIDES = new Set(['paternal', 'maternal', 'both']);
+
+/** Group the ancestors at one level into couples and count who descends from each. */
+function branchesAt(graph: FamilyGraph, ancestors: Set<string>, down: number, relatives: Set<string>): Branch[] {
+    const ids = [...ancestors];
+    const parent = new Map(ids.map((id) => [id, id]));
+    const find = (id: string): string => (parent.get(id) === id ? id : find(parent.get(id)!));
+    for (const id of ids) {
+        const p = graph.people.get(id)!;
+        for (const s of [...p.spouseIds, ...p.exSpouseIds]) {
+            if (ancestors.has(s)) parent.set(find(s), find(id));
+        }
+    }
+    const groups = new Map<string, string[]>();
+    for (const id of ids) groups.set(find(id), [...(groups.get(find(id)) ?? []), id]);
+
+    const branches: Branch[] = [];
+    for (const members of groups.values()) {
+        const reached = downFrom(graph, new Set(members), down);
+        const hits = new Set([...reached].filter((id) => relatives.has(id)));
+        if (hits.size === 0) continue;
+        const people = members.map((id) => graph.people.get(id)!).sort((a, b) => (a.gender === 'male' ? -1 : b.gender === 'male' ? 1 : 0));
+        branches.push({ label: people.map((x) => x.name).join(' & '), refs: people.map((x) => x.ref), members: hits });
+    }
+    return branches.sort((a, b) => b.members.size - a.members.size);
+}
+
+function filterLiving(graph: FamilyGraph, ids: Set<string>, living: unknown): Set<string> {
+    if (typeof living !== 'boolean') return ids;
+    return new Set([...ids].filter((id) => graph.people.get(id)!.isDeceased !== living));
+}
+
+function countLiving(graph: FamilyGraph, ids: Iterable<string>): { living: number; deceased: number } {
+    let living = 0;
+    let deceased = 0;
+    for (const id of ids) graph.people.get(id)!.isDeceased ? deceased++ : living++;
+    return { living, deceased };
+}
+
+function sameGenerationRelatives(graph: FamilyGraph, args: Record<string, unknown>): ToolResult {
+    const p = personOrError(graph, args.id);
+    if (isError(p)) return p;
+    const levels = ancestorLevels(graph, p.id);
+    const maxLevel = Math.min(clampInt(args.max_level, MAX_GENERATIONS, 1, MAX_GENERATIONS), levels.length - 1);
+    const includeSiblings = args.include_siblings !== false;
+    const limit = clampInt(args.limit, 40, 1, 200);
+    const offset = clampInt(args.offset, 0, 0, 100_000);
+
+    if (levels.length < 2) {
+        return {
+            person: ref(graph, p.id),
+            total: 0,
+            note: 'No parents are recorded for this person, so no relatives in their generation can be found.',
+        };
+    }
+
+    const seen = new Set<string>([p.id]);
+    const perLevel: { up: number; ids: Set<string> }[] = [];
+    for (let up = 1; up <= maxLevel; up++) {
+        const reached = downFrom(graph, levels[up], up);
+        const fresh = new Set([...reached].filter((id) => !seen.has(id)));
+        for (const id of reached) seen.add(id);
+        if (up === 1 && !includeSiblings) continue;
+        perLevel.push({ up, ids: filterLiving(graph, fresh, args.living) });
+    }
+
+    const entries: { person: GraphPerson; up: number; side: string | null; via: string }[] = [];
+    const levelSummaries = perLevel.map(({ up, ids }) => {
+        if (ids.size === 0) return { generations_up: up, relation: distanceLabel(up, up), count: 0 };
+        const sides = sidesAt(graph, p, up, up);
+        const branches = branchesAt(graph, levels[up], up, ids);
+        const viaOf = new Map<string, string>();
+        for (const b of branches) for (const id of b.members) if (!viaOf.has(id)) viaOf.set(id, b.label);
+        const sideCounts = { paternal: 0, maternal: 0, both: 0 };
+        for (const id of ids) {
+            const side = sides.side(id);
+            if (side) sideCounts[side]++;
+            entries.push({ person: graph.people.get(id)!, up, side, via: viaOf.get(id) ?? '' });
+        }
+        return {
+            generations_up: up,
+            relation: distanceLabel(up, up),
+            count: ids.size,
+            ...countLiving(graph, ids),
+            sides: sideCounts,
+            through: branches.slice(0, 6).map((b) => describeBranch(b, sides)),
+            ...(branches.length > 6 ? { more_branches: branches.length - 6 } : {}),
+        };
+    });
+
+    const sideOrder: Record<string, number> = { both: 0, paternal: 1, maternal: 2 };
+    entries.sort(
+        (a, b) =>
+            a.up - b.up ||
+            (sideOrder[a.side ?? ''] ?? 3) - (sideOrder[b.side ?? ''] ?? 3) ||
+            a.person.name.localeCompare(b.person.name),
+    );
+    const total = entries.length;
+    const placeholders = entries.filter((e) => PLACEHOLDER_NAME.test(e.person.name.trim())).length;
+    const listLevel = args.list_level != null ? clampInt(args.list_level, 0, 1, MAX_GENERATIONS) : null;
+    const listSide = SIDES.has(String(args.list_side)) ? String(args.list_side) : null;
+    const listed = entries.filter((e) => (listLevel == null || e.up === listLevel) && (!listSide || e.side === listSide));
+    const page = listed.slice(offset, offset + limit);
+    const { father, mother } = parentsOf(graph, p);
+
+    return {
+        person: ref(graph, p.id),
+        definition:
+            'Same generation = shares an ancestor the same number of generations up (siblings 1 up, first cousins 2 up, second cousins 3 up…). Each person is counted once, at the closest shared ancestor. Married-in spouses are not counted.',
+        total,
+        ...countLiving(graph, entries.map((e) => e.person.id)),
+        ...(typeof args.living === 'boolean' ? { filter: args.living ? 'living only' : 'deceased only' } : {}),
+        sides_key: { paternal: `through ${father?.name ?? 'father'}`, maternal: `through ${mother?.name ?? 'mother'}` },
+        levels: levelSummaries,
+        oldest_ancestor_level: levels.length - 1,
+        ...(placeholders
+            ? { placeholder_names: placeholders, placeholder_note: 'Some entries have placeholder names like FATHER or SON; they are counted.' }
+            : {}),
+        people: page.map((e) =>
+            brief(graph, e.person, {
+                is: distanceLabel(e.up, e.up).replace(/s$/, ''),
+                ...(e.side ? { side: e.side } : {}),
+                ...(e.via ? { through: e.via } : {}),
+            }),
+        ),
+        ...(listLevel != null || listSide
+            ? { list_filter: [listLevel != null ? distanceLabel(listLevel, listLevel) : null, listSide].filter(Boolean).join(', ') }
+            : {}),
+        shown: `${page.length ? offset + 1 : 0}-${offset + page.length} of ${listed.length}`,
+        ...(offset + page.length < listed.length ? { more: listed.length - offset - page.length } : {}),
+    };
+}
+
+function relativesAtDistanceTool(graph: FamilyGraph, args: Record<string, unknown>): ToolResult {
+    const p = personOrError(graph, args.id);
+    if (isError(p)) return p;
+    const up = clampInt(args.up, 0, 0, MAX_GENERATIONS);
+    const down = clampInt(args.down, 0, 0, MAX_GENERATIONS);
+    if (up === 0 && down === 0) return { error: 'up and down cannot both be 0' };
+    const limit = clampInt(args.limit, 40, 1, 200);
+    const offset = clampInt(args.offset, 0, 0, 100_000);
+
+    const levels = ancestorLevels(graph, p.id);
+    const ids = filterLiving(graph, relativesAtDistance(graph, levels, p.id, up, down), args.living);
+    const label = distanceLabel(up, down);
+    if (ids.size === 0) {
+        return {
+            person: ref(graph, p.id),
+            up,
+            down,
+            relation: label,
+            count: 0,
+            note:
+                up >= levels.length
+                    ? `Only ${levels.length - 1} generations of ancestors are recorded above this person.`
+                    : 'Nobody is recorded at this distance.',
+        };
+    }
+
+    const sides = up > 0 ? sidesAt(graph, p, up, down) : null;
+    const branches = up > 0 ? branchesAt(graph, levels[up], down, ids) : [];
+    const viaOf = new Map<string, string>();
+    for (const b of branches) for (const id of b.members) if (!viaOf.has(id)) viaOf.set(id, b.label);
+    const listSide = SIDES.has(String(args.list_side)) && sides ? String(args.list_side) : null;
+    const sorted = [...ids]
+        .map((id) => graph.people.get(id)!)
+        .filter((x) => !listSide || sides?.side(x.id) === listSide)
+        .sort((a, b) => a.name.localeCompare(b.name));
+    const page = sorted.slice(offset, offset + limit);
+    const sideCounts = { paternal: 0, maternal: 0, both: 0 };
+    if (sides) for (const id of ids) {
+        const side = sides.side(id);
+        if (side) sideCounts[side]++;
+    }
+
+    return {
+        person: ref(graph, p.id),
+        up,
+        down,
+        relation: label,
+        count: ids.size,
+        ...countLiving(graph, ids),
+        ...(sides ? { sides: sideCounts } : {}),
+        ...(branches.length
+            ? { through: branches.slice(0, 6).map((b) => describeBranch(b, sides)) }
+            : {}),
+        people: page.map((x) =>
+            brief(graph, x, {
+                ...(sides?.side(x.id) ? { side: sides.side(x.id) } : {}),
+                ...(viaOf.get(x.id) ? { through: viaOf.get(x.id) } : {}),
+            }),
+        ),
+        ...(listSide ? { list_filter: listSide } : {}),
+        shown: `${page.length ? offset + 1 : 0}-${offset + page.length} of ${sorted.length}`,
+        ...(offset + page.length < sorted.length ? { more: sorted.length - offset - page.length } : {}),
+    };
+}
+
+/* ------------------------------------------------------------------ */
 /*  Dispatcher                                                         */
 /* ------------------------------------------------------------------ */
 
-export async function runTool(name: string, rawArgs: string): Promise<{ result: ToolResult; graph: FamilyGraph }> {
+export async function runTool(
+    name: string,
+    rawArgs: string,
+    options: { isAdmin?: boolean } = {},
+): Promise<{ result: ToolResult; graph: FamilyGraph }> {
     const graph = await getFamilyGraph();
     let args: Record<string, unknown> = {};
     try {
         args = rawArgs ? JSON.parse(rawArgs) : {};
     } catch {
         return { result: { error: 'Arguments were not valid JSON' }, graph };
+    }
+    if (ADMIN_TOOL_NAMES.has(name) && !options.isAdmin) {
+        return { result: { error: 'This lookup is only available to admins.' }, graph };
     }
     let result: ToolResult;
     switch (name) {
@@ -767,6 +1153,12 @@ export async function runTool(name: string, rawArgs: string): Promise<{ result: 
             break;
         case 'family_stats':
             result = familyStats(graph);
+            break;
+        case 'same_generation_relatives':
+            result = sameGenerationRelatives(graph, args);
+            break;
+        case 'relatives_at_distance':
+            result = relativesAtDistanceTool(graph, args);
             break;
         default:
             result = { error: `Unknown tool ${name}` };
