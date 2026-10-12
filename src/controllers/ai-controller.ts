@@ -1,169 +1,168 @@
 import type { Response, NextFunction } from 'express';
 import type { AuthenticatedRequest } from '../types/index.js';
-import { getSubtreeLayout } from '../services/tree-service.js';
+import { AppError } from '../types/index.js';
+import { getAiConfig } from '../services/ai-provider.js';
+import * as chatService from '../services/ai-chat-service.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('ai-controller');
 
-const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const MODEL = process.env.AI_MODEL || 'gpt-4o-mini';
-const MAX_CONTEXT_PEOPLE = 8;
+const HEARTBEAT_MS = 15_000;
 
-interface ChatMessage {
-    role: 'user' | 'assistant';
-    content: string;
+function userIdOf(req: AuthenticatedRequest): string {
+    const userId = req.user?.userId;
+    if (!userId) throw new AppError('Not signed in', 401, 'ERR_AUTH');
+    return userId;
+}
+
+/** GET /api/ai/status — is the assistant switched on, and which model */
+export function status(_req: AuthenticatedRequest, res: Response): void {
+    const config = getAiConfig();
+    res.json({ enabled: config.enabled, model: config.model, modelLabel: config.modelLabel });
+}
+
+/** GET /api/ai/sessions */
+export async function listSessions(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+        res.json(await chatService.listSessions(userIdOf(req), Number(req.query.limit) || 100));
+    } catch (err) {
+        next(err);
+    }
+}
+
+/** POST /api/ai/sessions  { title? } */
+export async function createSession(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+        res.status(201).json(await chatService.createSession(userIdOf(req), req.body?.title));
+    } catch (err) {
+        next(err);
+    }
+}
+
+/** GET /api/ai/sessions/:id — session + messages */
+export async function getSession(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+        res.json(await chatService.getSessionWithMessages(userIdOf(req), req.params.id as string));
+    } catch (err) {
+        next(err);
+    }
+}
+
+/** PATCH /api/ai/sessions/:id  { title?, isPinned? } */
+export async function updateSession(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+        res.json(await chatService.updateSession(userIdOf(req), req.params.id as string, req.body ?? {}));
+    } catch (err) {
+        next(err);
+    }
+}
+
+/** DELETE /api/ai/sessions/:id */
+export async function deleteSession(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+        await chatService.deleteSession(userIdOf(req), req.params.id as string);
+        res.json({ message: 'Chat deleted' });
+    } catch (err) {
+        next(err);
+    }
 }
 
 /**
- * POST /api/ai/chat
- * Body: { messages: ChatMessage[], contextPersonIds?: string[] }
+ * POST /api/ai/sessions/:id/messages  (id may be "new")
+ * Body: { content, contextPersonIds?, regenerate? }
  *
- * Answers questions about the family. Selected people (plus their
- * immediate relatives' names) are serialized into the system prompt.
+ * Streams Server-Sent Events: ready, status, delta, discard, replace,
+ * done, error. Problems found before streaming starts (bad input, rate
+ * limit, busy chat) come back as a normal JSON error instead.
  */
-export async function chat(
-    req: AuthenticatedRequest,
-    res: Response,
-    next: NextFunction,
-): Promise<void> {
+export async function sendMessage(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    const abort = new AbortController();
+    res.on('close', () => {
+        if (!res.writableEnded) abort.abort();
+    });
+
+    let streaming = false;
+    let heartbeat: NodeJS.Timeout | undefined;
+    const emit = (event: string, data: unknown) => {
+        if (res.writableEnded || abort.signal.aborted) return;
+        if (!streaming) {
+            streaming = true;
+            res.status(200);
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders();
+            heartbeat = setInterval(() => {
+                if (!res.writableEnded) res.write(': ping\n\n');
+            }, HEARTBEAT_MS);
+        }
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
     try {
-        const apiKey = process.env.OPENAI_API_KEY;
-        if (!apiKey) {
-            res.status(503).json({
-                error: 'AI chat is not configured yet (missing OPENAI_API_KEY on the server).',
-            });
+        const userId = userIdOf(req);
+        await chatService.runSavedTurn({
+            userId,
+            personId: req.user?.personId,
+            sessionId: req.params.id as string,
+            content: req.body?.content,
+            contextPersonIds: req.body?.contextPersonIds,
+            regenerate: req.body?.regenerate === true,
+            signal: abort.signal,
+            emit,
+        });
+    } catch (err) {
+        if (!streaming) {
+            next(err);
             return;
         }
+        log.error('AI stream failed after start', { error: err instanceof Error ? err.message : String(err) });
+        emit('error', {
+            error: err instanceof AppError ? err.message : 'Something went wrong while answering.',
+            retryable: !(err instanceof AppError),
+        });
+    } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        if (streaming && !res.writableEnded) res.end();
+    }
+}
 
+/**
+ * POST /api/ai/chat — kept for app versions loaded before the Ask
+ * redesign. Body: { messages, contextPersonIds? } → { reply }
+ */
+export async function chat(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    const abort = new AbortController();
+    res.on('close', () => {
+        if (!res.writableEnded) abort.abort();
+    });
+    try {
         const { messages, contextPersonIds } = req.body as {
-            messages?: ChatMessage[];
+            messages?: { role: 'user' | 'assistant'; content: string }[];
             contextPersonIds?: string[];
         };
-
         if (!Array.isArray(messages) || messages.length === 0) {
             res.status(400).json({ error: 'messages array is required' });
             return;
         }
-
-        const trimmedMessages = messages
-            .filter(
-                (m) =>
-                    (m.role === 'user' || m.role === 'assistant') &&
-                    typeof m.content === 'string',
-            )
-            .slice(-12)
-            .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
-
-        /* Build family context from the requested people */
-        const people = req.user?.personId
-            ? await getSubtreeLayout(req.user.personId)
-            : {};
-        const nameOf = (id: string) => {
-            const p = people[id];
-            return p ? `${p.firstName} ${p.lastName || ''}`.trim() : 'Unknown';
-        };
-
-        const ids = Array.isArray(contextPersonIds)
-            ? contextPersonIds.slice(0, MAX_CONTEXT_PEOPLE)
-            : [];
-        const contextBlocks = ids
-            .map((id) => {
-                const p = people[id];
-                if (!p) return null;
-                const lines = [
-                    `Name: ${nameOf(id)}`,
-                    `Gender: ${p.gender}`,
-                    p.isDeceased
-                        ? `Deceased${p.deathYear ? ` (${p.deathYear})` : ''}`
-                        : 'Living',
-                    p.birthDate ? `Birthday: ${p.birthDate}` : null,
-                    p.location ? `Lives in: ${p.location}` : null,
-                    p.parentIds.length
-                        ? `Parents: ${p.parentIds.map(nameOf).join(', ')}`
-                        : null,
-                    p.spouseIds.length
-                        ? `Spouse(s): ${p.spouseIds.map(nameOf).join(', ')}`
-                        : null,
-                    p.exSpouseIds.length
-                        ? `Ex-spouse(s): ${p.exSpouseIds.map(nameOf).join(', ')}`
-                        : null,
-                    p.childrenIds.length
-                        ? `Children: ${p.childrenIds.map(nameOf).join(', ')}`
-                        : null,
-                ].filter(Boolean);
-                return lines.join('\n');
-            })
-            .filter(Boolean)
-            .join('\n\n---\n\n');
-
-        const totalPeople = Object.keys(people).length;
-        const systemPrompt = [
-            'You are a warm, concise assistant for a private family tree app used by one extended family.',
-            `The tree currently has ${totalPeople} people.`,
-            'Answer questions about family members using ONLY the context below plus general knowledge about kinship.',
-            'If the answer is not in the context, say you do not have that information and suggest attaching the relevant person as context.',
-            'Keep answers short. Use UPPERCASE for person names.',
-            contextBlocks
-                ? `\nSelected family context:\n\n${contextBlocks}`
-                : '\nNo people are attached as context.',
-        ].join('\n');
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
-
-        let response: globalThis.Response;
-        try {
-            response = await fetch(OPENAI_URL, {
-                method: 'POST',
-                signal: controller.signal,
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${apiKey}`,
-                },
-                body: JSON.stringify({
-                    model: MODEL,
-                    temperature: 0.3,
-                    max_tokens: 500,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        ...trimmedMessages,
-                    ],
-                }),
-            });
-        } finally {
-            clearTimeout(timeout);
-        }
-
-        if (!response.ok) {
-            const body = await response.text();
-            log.error('OpenAI request failed', { status: response.status, body: body.slice(0, 300) });
-            res.status(502).json({ error: 'The AI service could not answer right now.' });
-            return;
-        }
-
-        const data = (await response.json()) as {
-            choices?: Array<{ message?: { content?: string } }>;
-        };
-        const reply = data.choices?.[0]?.message?.content?.trim();
-        if (!reply) {
-            res.status(502).json({ error: 'The AI service returned an empty answer.' });
-            return;
-        }
-
-        log.info('AI chat answered', {
+        const clean = messages.filter(
+            (m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string',
+        );
+        const reply = await chatService.answerStateless({
             userId: req.user?.userId,
-            contextCount: ids.length,
-            messageCount: trimmedMessages.length,
+            personId: req.user?.personId,
+            messages: clean,
+            contextPersonIds: Array.isArray(contextPersonIds) ? contextPersonIds.map(String) : [],
+            signal: abort.signal,
         });
         res.json({ reply });
     } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-            res.status(504).json({ error: 'The AI service timed out.' });
+        if (abort.signal.aborted) return;
+        if (err instanceof Error && err.name === 'ProviderError') {
+            res.status(502).json({ error: err.message });
             return;
         }
-        log.error('AI chat failed', {
-            error: err instanceof Error ? err.message : String(err),
-        });
         next(err);
     }
 }

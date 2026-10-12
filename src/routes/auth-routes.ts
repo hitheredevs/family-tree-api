@@ -10,6 +10,9 @@ router.post('/login', authController.login);
 // POST /api/auth/logout
 router.post('/logout', authController.logout);
 
+// POST /api/auth/refresh — swap a valid token for a fresh one (requires token)
+router.post('/refresh', authMiddleware, authController.refresh);
+
 // PUT /api/auth/change-password (requires token)
 router.put('/change-password', authMiddleware, authController.changePassword);
 

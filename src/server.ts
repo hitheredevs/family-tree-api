@@ -27,7 +27,14 @@ app.set('etag', false);
 /* ------------------------------------------------------------------ */
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(compression());
+app.use(
+    compression({
+        // Streamed AI answers must reach the browser chunk by chunk
+        filter: (req, res) =>
+            !String(res.getHeader('Content-Type') ?? '').includes('text/event-stream') &&
+            compression.filter(req, res),
+    }),
+);
 app.use(express.json());
 
 app.use('/api', (_req, res, next) => {
